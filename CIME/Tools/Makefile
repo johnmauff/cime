@@ -523,9 +523,16 @@ ifeq ($(strip $(COMP_ATM)),cam)
   ifeq ($(CAM_DYCORE),mpas)
     # For building CAM with the MPAS dycore
     MPAS_LIBDIR:=$(abspath $(EXEROOT)/atm/obj/mpas)
+    # MPAS builds "in-source" as a tree of subdirectories (framework, core_atmosphere,
+    # operators, tools, external, driver, ...), each producing its own .mod files in its
+    # own subdirectory. Some compilers (e.g. nvfortran) require every one of these on the
+    # include path, even for a file outside the MPAS tree that only transitively depends
+    # on a module declared deeper in it (e.g. the driver's esm.F90, which only directly
+    # uses dyn_comp, but dyn_comp itself uses a module from mpas/framework).
+    MPAS_INCLDIRS:=$(shell find $(MPAS_LIBDIR) -type d 2>/dev/null)
     ifeq ($(COMP_NAME),driver)
       # This is needed by some compilers when building the driver.
-      INCLDIR+=-I$(MPAS_LIBDIR)
+      INCLDIR+=$(addprefix -I,$(MPAS_INCLDIRS))
     endif
   endif
 endif
@@ -563,7 +570,7 @@ ifdef MPAS_LIBDIR
   ifeq ($(PIO_VERSION),2)
     PIODEF := -DUSE_PIO2
   endif
-  INCLDIR+=-I$(MPAS_LIBDIR)
+  INCLDIR+=$(addprefix -I,$(MPAS_INCLDIRS))
   INCLDIR+=-I$(abspath $(EXEROOT)/atm/obj)
 
 # To ensure that the MPAS-A dycore library is always updated whenever dycore source
@@ -574,10 +581,39 @@ ifdef MPAS_LIBDIR
 # The CASEROOT, COMPILER and MACH are added so that the Depends file could be visible to
 # the MPAS dycore.
 # The OPENACC_GPU_FLAGS is added so that the GPU flags defined in ccs_config_cesm could also be
-# used to build the MPAS dycore if needed.
+# used to build the MPAS dycore if needed -- but nothing in MPAS's own build (Makefile.CESM/
+# Makefile.in.CESM/core_atmosphere Makefiles) actually references this variable (confirmed: zero
+# matches anywhere under src/dynamics/mpas), so passing it alone is a no-op. What MPAS's own
+# generic compile rules (e.g. Makefile.in.CESM's "%.o: %.F90" rule) actually use is $(FFLAGS)
+# directly -- and on an nvhpc GPU case, an ambient CRAY_ACCEL_TARGET environment variable (set by
+# the loaded cuda/* module, case-wide, not by anything this Makefile requests) makes nvfortran
+# silently enable real OpenACC codegen for ANY file with no explicit -acc/-noacc of its own,
+# confirmed directly via `nm` on a compiled MPAS object showing real __pgi_uacc_* runtime calls
+# despite no -acc anywhere in its own logged compile line. So MPAS's dycore was always picking up
+# real GPU compilation whenever OPENACC_GPU_OFFLOAD was on, with no way to turn it off
+# independently of the CCPP physics suite -- which surfaced as an OpenACC "PRESENT clause was not
+# found on device" crash for MPAS's own rho_zz, since MPAS's own device-residency coverage doesn't
+# actually match what its "!$acc parallel default(present)" regions need yet.
+#
+# MPAS_DYCORE_GPU_OFFLOAD (default FALSE) makes this explicit and toggleable in $(FFLAGS) itself,
+# independently of OPENACC_GPU_FLAGS/OPENACC_GPU_OFFLOAD above: FALSE appends $(ACC_OFF_FLAG),
+# overriding the ambient CRAY_ACCEL_TARGET default so MPAS's dycore compiles entirely for the host
+# regardless of it -- isolating real GPU execution to the CCPP physics suite (e.g. kessler) only,
+# sidestepping MPAS's own residency gaps until they're fixed. TRUE appends the same
+# $(OPENACC_GPU_FLAGS) the CCPP physics files get instead, once MPAS's own device residency is
+# ready for it. Must be $(ACC_OFF_FLAG), not a hardcoded "-noacc": that's an nvhpc-only flag
+# (ACC_OFF_FLAG is deliberately left undefined/empty for gnu/intel in their own cmake_macros/*.cmake,
+# same idiom OPENACC_GPU_FLAGS already uses) -- a hardcoded -noacc broke gnu/intel MPAS builds
+# outright ("gfortran: error: unrecognized command-line option '-noacc'").
+ifeq ($(MPAS_DYCORE_GPU_OFFLOAD),TRUE)
+  MPAS_ACC_FFLAGS := $(OPENACC_GPU_FLAGS)
+else
+  MPAS_ACC_FFLAGS := $(ACC_OFF_FLAG)
+endif
+
 libmpas: cam_abortutils.o physconst.o
 	$(MAKE) -C $(MPAS_LIBDIR) CC="$(CC)" FC="$(FC)" PIODEF="$(PIODEF)" \
-	FFLAGS='$(FREEFLAGS) $(FFLAGS)' OPENACC_GPU_FLAGS='$(OPENACC_GPU_FLAGS)' \
+	FFLAGS='$(FREEFLAGS) $(FFLAGS) $(MPAS_ACC_FFLAGS)' OPENACC_GPU_FLAGS='$(OPENACC_GPU_FLAGS)' \
 	CASEROOT='$(CASEROOT)' COMPILER='$(COMPILER)' MACH='$(MACH)' \
 	FCINCLUDES='$(INCLDIR) $(INCS) -I$(ABS_INSTALL_SHAREDPATH)/include -I$(ABS_ESMF_PATH)/include'
 
@@ -964,17 +1000,17 @@ $(COMPLIB): $(OBJS)
 	$(AR) $(ARFLAGS) $(COMPLIB) $(OBJS)
 
 .c.o:
-	$(CC) -c $(INCLDIR) $(INCS) $(CFLAGS)  $<
+	$(CC) -c $(INCLDIR) $(INCS) $(CFLAGS) $(ACC_OFF_FLAG) $<
 .F.o:
-	$(FC) -c $(INCLDIR) $(INCS) $(FFLAGS) $(FIXEDFLAGS) $<
+	$(FC) -c $(INCLDIR) $(INCS) $(FFLAGS) $(FIXEDFLAGS) $(ACC_OFF_FLAG) $<
 .f.o:
-	$(FC) -c $(INCLDIR) $(INCS) $(FFLAGS) $(FIXEDFLAGS) $<
+	$(FC) -c $(INCLDIR) $(INCS) $(FFLAGS) $(FIXEDFLAGS) $(ACC_OFF_FLAG) $<
 .f90.o:
-	$(FC) -c $(INCLDIR) $(INCS) $(FFLAGS) $(FREEFLAGS)  $<
+	$(FC) -c $(INCLDIR) $(INCS) $(FFLAGS) $(FREEFLAGS) $(ACC_OFF_FLAG) $<
 .F90.o:
-	$(FC) -c $(INCLDIR) $(INCS) $(FFLAGS) $(FREEFLAGS) $(CONTIGUOUS_FLAG) $<
+	$(FC) -c $(INCLDIR) $(INCS) $(FFLAGS) $(FREEFLAGS) $(CONTIGUOUS_FLAG) $(ACC_OFF_FLAG) $<
 .cpp.o:
-	$(CXX) -c $(INCLDIR) $(INCS) $(CXXFLAGS)  $<
+	$(CXX) -c $(INCLDIR) $(INCS) $(CXXFLAGS) $(ACC_OFF_FLAG) $<
 
 %.F90: %.F90.in
 	$(GENF90) $< > $@
