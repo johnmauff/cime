@@ -6,9 +6,11 @@ if there is no queueing system.  A cesm workflow may include multiple
 jobs.
 submit, check_case and check_da_settings are members of class Case in file case.py
 """
+
 import configparser
 from CIME.XML.standard_module_setup import *
-from CIME.utils import expect, CIMEError, get_time_in_seconds
+from CIME.core.exceptions import CIMEError
+from CIME.utils import expect, get_time_in_seconds
 from CIME.status import run_and_log_case_status
 from CIME.locked_files import (
     unlock_file,
@@ -355,6 +357,9 @@ def check_case(self, skip_pnl=False, chksum=False):
         elif ncpl_base_period == "decade":
             coupling_secs = 315360000 / maxncpl
             timestep = 315360000 / minncpl
+        else:
+            raise CIMEError("ncpl_base_period handling error")
+
         stop_option = self.get_value("STOP_OPTION")
         stop_n = self.get_value("STOP_N")
         if stop_option == "nsteps":

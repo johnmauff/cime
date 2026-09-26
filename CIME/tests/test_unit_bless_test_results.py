@@ -1,6 +1,7 @@
 import re
 import unittest
 import tempfile
+from contextlib import ExitStack
 from unittest import mock
 from pathlib import Path
 
@@ -13,6 +14,8 @@ from CIME.bless_test_results import (
     is_hist_bless_needed,
 )
 from CIME.test_status import ALL_PHASES, GENERATE_PHASE
+from CIME.tests import utils as test_utils
+from CIME.core.exceptions import CIMEError
 
 
 class TestUnitBlessTestResults(unittest.TestCase):
@@ -918,6 +921,44 @@ class TestUnitBlessTestResults(unittest.TestCase):
 
         assert success
 
+    # TODO should update all tests to use mock_case
+    def test_bless_results_invalid_case(self):
+        with ExitStack() as stack:
+            tempdir = stack.enter_context(tempfile.TemporaryDirectory())
+            tests = [
+                (
+                    "SMS.T62_oQU120_ais20.A",
+                    "PASS {0} CREATE_NEWCASE\nPASS {0} XML\nPASS {0} SETUP",
+                ),
+                (
+                    "SMS.f19_g16.X",
+                    "PASS {0} CREATE_NEWCASE\nPASS {0} XML\nPASS {0} SETUP",
+                ),
+            ]
+
+            # call outer function with None to return mocked objects
+            cases = [
+                test_utils.mock_case(
+                    casename=f"{x[0]}.dane_oneapi-ifx.20251219_120951_epolnk",
+                    tempdir=tempdir,
+                )(None)
+                for x in tests
+            ]
+
+            caseroots = [Path(x[2]) for x in cases]
+
+            # write a simple test status file
+            for i, x in enumerate(caseroots):
+                x.mkdir(parents=True, exist_ok=True)
+                with (x / "TestStatus").open("w") as f:
+                    f.write(tests[i][1].format(tests[i][0]))
+
+            success = bless_test_results(
+                "master", "/tmp/baseline", str(caseroots[0].parent), "oneapi-ifx"
+            )
+
+            self.assertFalse(success)
+
     @mock.patch("CIME.bless_test_results.Case")
     @mock.patch("CIME.bless_test_results.TestStatus")
     @mock.patch("CIME.bless_test_results.get_test_status_files")
@@ -974,7 +1015,7 @@ class TestUnitBlessTestResults(unittest.TestCase):
         )
 
         assert not needed
-        assert broken_blesses == [("SMS.f19_g16.A", "test did not pass")]
+        assert broken_blesses == [("SMS.f19_g16.A", "test did not pass (SKIP)")]
 
     def test_is_bless_needed_generate_fail(self):
         ts = mock.MagicMock()
@@ -1023,7 +1064,7 @@ class TestUnitBlessTestResults(unittest.TestCase):
         )
 
         assert not needed
-        assert broken_blesses == [("SMS.f19_g16.A", "run phase did not pass")]
+        assert broken_blesses == [("SMS.f19_g16.A", "run phase did not pass (SKIP)")]
 
     def test_is_bless_needed_no_run_phase(self):
         ts = mock.MagicMock()
@@ -1036,7 +1077,7 @@ class TestUnitBlessTestResults(unittest.TestCase):
         )
 
         assert not needed
-        assert broken_blesses == [("SMS.f19_g16.A", "no run phase")]
+        assert broken_blesses == [("SMS.f19_g16.A", "no run phase (SKIP)")]
 
     def test_is_bless_needed(self):
         ts = mock.MagicMock()

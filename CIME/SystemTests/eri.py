@@ -90,7 +90,11 @@ class ERI(SystemTestsCommon):
         start_1_year, start_1_month, start_1_day = [
             int(item) for item in start_1.split("-")
         ]
-        start_2_year = start_1_year + 2
+        # Change the year for the hybrid case to make sure the system can handle this change in year.
+        # Note: When using a Gregorian calendar, it is important for the two years to be leap years
+        #       because a testmod which tests the gregorian calendar starts the runs on leap day,
+        #       which must exist in all of the start years.
+        start_2_year = start_1_year + 4
         start_2 = "{:04d}-{:02d}-{:02d}".format(
             start_2_year, start_1_month, start_1_day
         )
@@ -219,6 +223,15 @@ class ERI(SystemTestsCommon):
         # (3a) Test run:
         # do a branch run from ref2 restart (short term archiving is off)
         #
+        # One aspect of this branch run worth noting is that it writes an extra set of
+        # restart files in the middle of the run, which are not written in the reference
+        # case. (These restart files are needed for the final continue run.) This is one
+        # of the few (or only) instances in the CIME System Tests where we do a comparison
+        # between two runs where one run has written an extra set of restart files
+        # part-way through. This can catch a particular type of error that arises
+        # occasionally: where the mere act of *writing* a restart file can change answers.
+        # (See also the discussion in https://github.com/ESMCI/cime/issues/4859.)
+        #
 
         os.chdir(caseroot)
         self._set_active_case(orig_case)
@@ -268,7 +281,7 @@ class ERI(SystemTestsCommon):
 
         self._skip_pnl = False
         # run branch case (short term archiving is off)
-        self.run_indv()
+        self.run_indv(suffix="branch")
 
         #
         # (3b) Test run:
@@ -298,5 +311,17 @@ class ERI(SystemTestsCommon):
         # do the restart run (short term archiving is off)
         self.run_indv(suffix="rest")
 
-        self._component_compare_test("base", "hybrid")
-        self._component_compare_test("base", "rest")
+        # Note that, for both of these comparisons, the "test" case comes first and the
+        # "control" case comes second: the branch case is compared against the hybrid case
+        # (which it branched off of, and so serves as its "control"); the "rest" run is a
+        # restart from the branch case and so is compared against this branch case. We
+        # make this choice because the cprnc output file names are derived from the first
+        # suffix, so:
+        # - Listing the "test" case as the first suffix means that the cprnc files are
+        #   named with the name of the case we're testing in that cprnc comparison, which
+        #   is more intuitive.
+        # - Having the first suffix differ between the two comparisons is important to
+        #   avoid having the cprnc output files from the second comparison overwrite the
+        #   files from the first comparison.
+        self._component_compare_test("branch", "hybrid")
+        self._component_compare_test("rest", "branch")

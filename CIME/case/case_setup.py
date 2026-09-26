@@ -20,6 +20,7 @@ from CIME.utils import (
     copy_local_macros_to_dir,
     batch_jobid,
     run_cmd_no_fail,
+    CIMEError,
 )
 from CIME.status import run_and_log_case_status, append_case_status
 from CIME.test_status import *
@@ -151,13 +152,15 @@ def _create_macros_cmake(
     # This impl is coupled to contents of Macros.cmake
     os_ = mach_obj.get_value("OS")
     mach = mach_obj.get_machine_name()
+    deprecated = "{}_{}.cmake".format(compiler, mach)
     macros = [
         "universal.cmake",
         os_ + ".cmake",
         compiler + ".cmake",
         "{}_{}.cmake".format(compiler, os),
         mach + ".cmake",
-        "{}_{}.cmake".format(compiler, mach),
+        "{}_{}.cmake".format(mach, compiler),
+        deprecated,
         "CMakeLists.txt",
     ]
     for macro in macros:
@@ -165,10 +168,19 @@ def _create_macros_cmake(
         mach_repo_macro = os.path.join(cmake_macros_dir, "..", mach, macro)
         case_macro = os.path.join(case_cmake_path, macro)
         if not os.path.exists(case_macro):
+            copied = False
             if os.path.exists(mach_repo_macro):
                 safe_copy(mach_repo_macro, case_cmake_path)
+                copied = True
             elif os.path.exists(repo_macro):
                 safe_copy(repo_macro, case_cmake_path)
+                copied = True
+
+            if copied and macro == deprecated:
+                logger.warning(
+                    "\nWARNING: Macros of the form COMPILER_MACHINE.cmake are deprecated "
+                    "and should be replaced with the form MACHINE_COMPILER.cmake\n"
+                )
 
     copy_depends_files(mach, mach_obj.machines_dir, caseroot, compiler)
 
@@ -309,15 +321,17 @@ def _case_setup_impl(
         comp_interface = case.get_value("COMP_INTERFACE")
         if comp_interface == "nuopc":
             ninst = case.get_value("NINST")
+        else:
+            ninst = 1
 
         multi_driver = case.get_value("MULTI_DRIVER")
-
         for comp in models:
             ntasks = case.get_value("NTASKS_{}".format(comp))
             if comp == "CPL":
                 continue
             if comp_interface != "nuopc":
                 ninst = case.get_value("NINST_{}".format(comp))
+
             if multi_driver:
                 if comp_interface != "nuopc":
                     expect(
@@ -407,11 +421,11 @@ def _case_setup_impl(
             ngpus_per_node = case.get_value("NGPUS_PER_NODE")
             if gpu_type and str(gpu_type).lower() != "none":
                 if max_gpus_per_node <= 0:
-                    raise RuntimeError(
+                    raise CIMEError(
                         f"MAX_GPUS_PER_NODE must be larger than 0 for machine={mach} and compiler={compiler} in order to configure a GPU run"
                     )
                 if not gpu_offload:
-                    raise RuntimeError(
+                    raise CIMEError(
                         "GPU_TYPE is defined but none of the GPU OFFLOAD options are enabled"
                     )
                 case.gpu_enabled = True
@@ -423,11 +437,11 @@ def _case_setup_impl(
                         else max_gpus_per_node,
                     )
             elif gpu_offload:
-                raise RuntimeError(
+                raise CIMEError(
                     "GPU_TYPE is not defined but at least one GPU OFFLOAD option is enabled"
                 )
             elif ngpus_per_node and ngpus_per_node != 0:
-                raise RuntimeError(
+                raise CIMEError(
                     f"ngpus_per_node is expected to be 0 for a pure CPU run ; {ngpus_per_node} is provided instead ;"
                 )
 
@@ -484,8 +498,8 @@ def _case_setup_impl(
                 ):
                     logger.info("Running cam.case_setup.py")
                     run_cmd_no_fail(
-                        "python {cam}/cime_config/cam.case_setup.py {cam} {case}".format(
-                            cam=camroot, case=caseroot
+                        "python {cam}/cime_config/cam.case_setup.py {cam} {case} {non_local}".format(
+                            cam=camroot, case=caseroot, non_local=str(non_local)
                         )
                     )
 

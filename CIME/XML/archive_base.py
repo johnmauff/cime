@@ -9,6 +9,24 @@ logger = logging.getLogger(__name__)
 
 
 class ArchiveBase(GenericXML):
+    def get_archive_specs(self):
+        components_element = self.get_child("components")
+
+        return self.get_children("comp_archive_spec", root=components_element)
+
+    def get_rpointer_nodes(self, root):
+        assert root.name == "comp_archive_spec"
+
+        return self.get_children("rpointer", root=root)
+
+    def get_rpointers(self, root):
+        for node in self.get_rpointer_nodes(root):
+            file = self.get_child("rpointer_file", root=node).text
+
+            content = self.get_child("rpointer_content", root=node).text
+
+            yield file, content
+
     def exclude_testing(self, compname):
         """
         Checks if component should be excluded from testing.
@@ -139,7 +157,13 @@ class ArchiveBase(GenericXML):
         for ext in extensions:
             if ext.endswith("$") and has_suffix:
                 ext = ext[:-1]
-            string = model + r"\d?_?(\d{4})?(_d\d{2})?\." + ext
+            # The first part of this regex forces the model name to appear
+            # either at the start of the string or following a '.', '-' or '_'.
+            # Without this, re.search would find the model name anywhere in the
+            # file name, so a model whose name is a substring of another model's
+            # name (e.g. "eam" within "scream") would match the other model's
+            # history files.
+            string = r"(?:^|[\.\-_])" + model + r"\d?_?(\d{4})?(_d\d{2})?\." + ext
             if has_suffix:
                 if not suffix in string:
                     string += r"\." + suffix + "$"

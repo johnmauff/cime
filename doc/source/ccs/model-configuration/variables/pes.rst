@@ -326,6 +326,8 @@ following meanings:
      -  The global MPI task of the component root task; if negative, indicates nodes rather than tasks. The root processor for each component is set relative to the MPI global communicator.
    * - PSTRID
      - The stride of MPI tasks across the global set of pes (for now set to 1). This variable is currently not used and is a placeholder for future development.
+   * - EXCL_STRIDE
+     - Stride of MPI tasks owned exclusively by a component. If 0, exclusivity is disabled.
    * - NINST
      -  The number of component instances, which are spread evenly across NTASKS.
    * - COST_PER_NODE
@@ -434,8 +436,8 @@ help determine the optimal load balance.
 Changing the pe layout of the model has NO IMPACT on the scientific
 results. The basic order of operations and calling sequence are
 hardwired into the driver and do not change with the pe
-layout. However, both CESM and E3SM do impose some contraints in the
-tempororal evolution of the components.  For example, the prognostic
+layout. However, models such as CESM and E3SM may impose some constraints in the
+temporal evolution of the components.  For example, the prognostic
 atmosphere model always run sequentially with the ice and land models
 for scientific reasons. As a result, running the atmosphere
 concurrently with the ice and land will result in idle processors at

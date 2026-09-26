@@ -1,13 +1,14 @@
 # pylint: disable=import-error
-import queue
-import os, time, threading, socket, signal, shutil, glob
+import queue, os, time, threading, socket, signal, shutil, glob, tempfile
+from pathlib import Path
 
 # pylint: disable=import-error
 import logging
 import xml.etree.ElementTree as xmlet
 
 import CIME.utils
-from CIME.utils import expect, Timeout, run_cmd_no_fail, safe_copy, CIMEError
+from CIME.core.exceptions import CIMEError
+from CIME.utils import expect, Timeout, run_cmd, run_cmd_no_fail, safe_copy
 from CIME.XML.machines import Machines
 from CIME.test_status import *
 from CIME.provenance import save_test_success
@@ -17,6 +18,8 @@ SIGNAL_RECEIVED = False
 E3SM_MAIN_CDASH = "E3SM"
 CDASH_DEFAULT_BUILD_GROUP = "ACME_Latest"
 SLEEP_INTERVAL_SEC = 0.1
+ENV_VAR_KEEP_CDASH = "CIME_TEST_CDASH_WFT"
+
 
 ###############################################################################
 def signal_handler(*_):
@@ -39,7 +42,7 @@ def get_test_time(test_path):
     ts = TestStatus(test_dir=test_path)
     comment = ts.get_comment(RUN_PHASE)
     if "time=" not in comment:
-        logging.warning("No run-phase time data found in {}".format(test_path))
+        logging.warning(f"No run-phase time data found in {test_path}")
         return 0
     else:
         time_data = [token for token in comment.split() if token.startswith("time=")][0]
@@ -80,7 +83,7 @@ def get_test_output(test_path):
     if os.path.exists(output_file):
         return open(output_file, "r").read()
     else:
-        logging.warning("File '{}' not found".format(output_file))
+        logging.warning(f"File '{output_file}' not found")
         return ""
 
 
@@ -92,30 +95,22 @@ def create_cdash_xml_boiler(
     utc_time,
     current_time,
     hostname,
-    git_commit,
 ):
     ###############################################################################
     site_elem = xmlet.Element("Site")
 
-    if "JENKINS_START_TIME" in os.environ:
-        time_info_str = "Total testing time: {:d} seconds".format(
-            int(current_time) - int(os.environ["JENKINS_START_TIME"])
-        )
-    else:
-        time_info_str = ""
-
     site_elem.attrib["BuildName"] = cdash_build_name
-    site_elem.attrib["BuildStamp"] = "{}-{}".format(utc_time, cdash_build_group)
+    site_elem.attrib["BuildStamp"] = f"{utc_time}-{cdash_build_group}"
     site_elem.attrib["Name"] = hostname
     site_elem.attrib["OSName"] = "Linux"
     site_elem.attrib["Hostname"] = hostname
-    site_elem.attrib["OSVersion"] = "Commit: {}{}".format(git_commit, time_info_str)
+    site_elem.attrib["OSVersion"] = "Unknown"
 
     phase_elem = xmlet.SubElement(site_elem, phase)
 
     xmlet.SubElement(phase_elem, "StartDateTime").text = time.ctime(current_time)
     xmlet.SubElement(
-        phase_elem, "Start{}Time".format("Test" if phase == "Testing" else phase)
+        phase_elem, f"Start{'Test' if phase == 'Testing' else phase}Time"
     ).text = str(int(current_time))
 
     return site_elem, phase_elem
@@ -130,7 +125,6 @@ def create_cdash_config_xml(
     current_time,
     hostname,
     data_rel_path,
-    git_commit,
 ):
     ###############################################################################
     site_elem, config_elem = create_cdash_xml_boiler(
@@ -140,7 +134,6 @@ def create_cdash_config_xml(
         utc_time,
         current_time,
         hostname,
-        git_commit,
     )
 
     xmlet.SubElement(config_elem, "ConfigureCommand").text = "namelists"
@@ -154,9 +147,7 @@ def create_cdash_config_xml(
         nml_phase_result = get_test_phase(test_norm_path, NAMELIST_PHASE)
         if nml_phase_result == TEST_FAIL_STATUS:
             nml_diff = get_nml_diff(test_norm_path)
-            cdash_warning = "CMake Warning:\n\n{} NML DIFF:\n{}\n".format(
-                test_name, nml_diff
-            )
+            cdash_warning = f"CMake Warning:\n\n{test_name} NML DIFF:\n{nml_diff}\n"
             config_results.append(cdash_warning)
 
     xmlet.SubElement(config_elem, "Log").text = "\n".join(config_results)
@@ -165,7 +156,7 @@ def create_cdash_config_xml(
     xmlet.SubElement(config_elem, "ElapsedMinutes").text = "0"  # Skip for now
 
     etree = xmlet.ElementTree(site_elem)
-    etree.write(os.path.join(data_rel_path, "Configure.xml"))
+    etree.write(data_rel_path / "Configure.xml")
 
 
 ###############################################################################
@@ -177,7 +168,6 @@ def create_cdash_build_xml(
     current_time,
     hostname,
     data_rel_path,
-    git_commit,
 ):
     ###############################################################################
     site_elem, build_elem = create_cdash_xml_boiler(
@@ -187,7 +177,6 @@ def create_cdash_build_xml(
         utc_time,
         current_time,
         hostname,
-        git_commit,
     )
 
     xmlet.SubElement(build_elem, "ConfigureCommand").text = "case.build"
@@ -214,7 +203,7 @@ def create_cdash_build_xml(
     xmlet.SubElement(build_elem, "ElapsedMinutes").text = "0"  # Skip for now
 
     etree = xmlet.ElementTree(site_elem)
-    etree.write(os.path.join(data_rel_path, "Build.xml"))
+    etree.write(data_rel_path / "Build.xml")
 
 
 ###############################################################################
@@ -226,7 +215,6 @@ def create_cdash_test_xml(
     current_time,
     hostname,
     data_rel_path,
-    git_commit,
 ):
     ###############################################################################
     site_elem, testing_elem = create_cdash_xml_boiler(
@@ -236,7 +224,6 @@ def create_cdash_test_xml(
         utc_time,
         current_time,
         hostname,
-        git_commit,
     )
 
     test_list_elem = xmlet.SubElement(testing_elem, "TestList")
@@ -298,28 +285,20 @@ def create_cdash_test_xml(
     xmlet.SubElement(testing_elem, "ElapsedMinutes").text = "0"  # Skip for now
 
     etree = xmlet.ElementTree(site_elem)
-
-    etree.write(os.path.join(data_rel_path, "Test.xml"))
+    etree.write(data_rel_path / "Test.xml")
 
 
 ###############################################################################
 def create_cdash_xml_fakes(
-    results, cdash_build_name, cdash_build_group, utc_time, current_time, hostname
+    results,
+    cdash_build_name,
+    cdash_build_group,
+    utc_time,
+    current_time,
+    hostname,
+    data_rel_path,
 ):
     ###############################################################################
-    # We assume all cases were created from the same code repo
-    first_result_case = os.path.dirname(list(results.items())[0][1][0])
-    try:
-        srcroot = run_cmd_no_fail(
-            "./xmlquery --value SRCROOT", from_dir=first_result_case
-        )
-    except CIMEError:
-        # Use repo containing this script as last resort
-        srcroot = os.path.join(CIME.utils.get_cime_root(), "..")
-
-    git_commit = CIME.utils.get_current_commit(repo=srcroot)
-
-    data_rel_path = os.path.join("Testing", utc_time)
 
     create_cdash_config_xml(
         results,
@@ -329,7 +308,6 @@ def create_cdash_xml_fakes(
         current_time,
         hostname,
         data_rel_path,
-        git_commit,
     )
 
     create_cdash_build_xml(
@@ -340,7 +318,6 @@ def create_cdash_xml_fakes(
         current_time,
         hostname,
         data_rel_path,
-        git_commit,
     )
 
     create_cdash_test_xml(
@@ -351,118 +328,109 @@ def create_cdash_xml_fakes(
         current_time,
         hostname,
         data_rel_path,
-        git_commit,
     )
 
 
 ###############################################################################
 def create_cdash_upload_xml(
-    results, cdash_build_name, cdash_build_group, utc_time, hostname, force_log_upload
+    results,
+    cdash_build_name,
+    cdash_build_group,
+    utc_time,
+    hostname,
+    force_log_upload,
+    tmp_path,
+    data_rel_path,
 ):
     ###############################################################################
 
-    data_rel_path = os.path.join("Testing", utc_time)
+    log_dirname = f"{cdash_build_name}_logs"
+    log_path = tmp_path / log_dirname
 
-    try:
-        log_dir = "{}_logs".format(cdash_build_name)
+    need_to_upload = False
 
-        need_to_upload = False
+    for test_name, test_data in results.items():
+        test_path, test_status, _ = test_data
 
-        for test_name, test_data in results.items():
-            test_path, test_status, _ = test_data
+        if test_status != TEST_PASS_STATUS or force_log_upload:
+            test_case_dir = os.path.dirname(test_path)
 
-            if test_status != TEST_PASS_STATUS or force_log_upload:
-                test_case_dir = os.path.dirname(test_path)
+            case_dirs = [test_case_dir]
+            case_base = os.path.basename(test_case_dir)
+            test_case2_dir = os.path.join(test_case_dir, "case2", case_base)
+            if os.path.exists(test_case2_dir):
+                case_dirs.append(test_case2_dir)
 
-                case_dirs = [test_case_dir]
-                case_base = os.path.basename(test_case_dir)
-                test_case2_dir = os.path.join(test_case_dir, "case2", case_base)
-                if os.path.exists(test_case2_dir):
-                    case_dirs.append(test_case2_dir)
+            for case_dir in case_dirs:
+                for param in ["EXEROOT", "RUNDIR", "CASEDIR"]:
+                    if param == "CASEDIR":
+                        log_src_dir = case_dir
+                    else:
+                        # it's possible that tests that failed very badly/early, and fake cases for testing
+                        # will not be able to support xmlquery
+                        try:
+                            log_src_dir = run_cmd_no_fail(
+                                f"./xmlquery {param} --value",
+                                from_dir=case_dir,
+                            )
+                        except CIMEError:
+                            continue
 
-                for case_dir in case_dirs:
-                    for param in ["EXEROOT", "RUNDIR", "CASEDIR"]:
-                        if param == "CASEDIR":
-                            log_src_dir = case_dir
+                    log_dst_dir = (
+                        log_path
+                        / f"{test_name}{'' if case_dir == test_case_dir else '.case2'}_{param}_logs"
+                    )
+                    log_dst_dir.mkdir(parents=True)
+                    for log_file in glob.glob(os.path.join(log_src_dir, "*log*")):
+                        if os.path.isdir(log_file):
+                            shutil.copytree(
+                                log_file, log_dst_dir / os.path.basename(log_file)
+                            )
                         else:
-                            # it's possible that tests that failed very badly/early, and fake cases for testing
-                            # will not be able to support xmlquery
-                            try:
-                                log_src_dir = run_cmd_no_fail(
-                                    "./xmlquery {} --value".format(param),
-                                    from_dir=case_dir,
-                                )
-                            except:
-                                continue
+                            safe_copy(log_file, str(log_dst_dir))
+                    for log_file in glob.glob(
+                        os.path.join(log_src_dir, "*.cprnc.out*")
+                    ):
+                        safe_copy(log_file, str(log_dst_dir))
 
-                        log_dst_dir = os.path.join(
-                            log_dir,
-                            "{}{}_{}_logs".format(
-                                test_name,
-                                "" if case_dir == test_case_dir else ".case2",
-                                param,
-                            ),
-                        )
-                        os.makedirs(log_dst_dir)
-                        for log_file in glob.glob(os.path.join(log_src_dir, "*log*")):
-                            if os.path.isdir(log_file):
-                                shutil.copytree(
-                                    log_file,
-                                    os.path.join(
-                                        log_dst_dir, os.path.basename(log_file)
-                                    ),
-                                )
-                            else:
-                                safe_copy(log_file, log_dst_dir)
-                        for log_file in glob.glob(
-                            os.path.join(log_src_dir, "*.cprnc.out*")
-                        ):
-                            safe_copy(log_file, log_dst_dir)
+            need_to_upload = True
 
-                need_to_upload = True
+    if need_to_upload:
 
-        if need_to_upload:
+        tarball = f"{log_dirname}.tar.gz"
 
-            tarball = "{}.tar.gz".format(log_dir)
-            if os.path.exists(tarball):
-                os.remove(tarball)
+        run_cmd_no_fail(
+            f"tar -cf - {log_dirname} | gzip -c",
+            arg_stdout=tarball,
+            from_dir=str(tmp_path),
+        )
+        base64 = run_cmd_no_fail(f"base64 {tarball}", from_dir=str(tmp_path))
 
-            run_cmd_no_fail(
-                "tar -cf - {} | gzip -c".format(log_dir), arg_stdout=tarball
-            )
-            base64 = run_cmd_no_fail("base64 {}".format(tarball))
-
-            xml_text = r"""<?xml version="1.0" encoding="UTF-8"?>
+        xml_text = f"""<?xml version="1.0" encoding="UTF-8"?>
 <?xml-stylesheet type="text/xsl" href="Dart/Source/Server/XSL/Build.xsl <file:///Dart/Source/Server/XSL/Build.xsl> "?>
-<Site BuildName="{}" BuildStamp="{}-{}" Name="{}" Generator="ctest3.0.0">
+<Site BuildName="{cdash_build_name}" BuildStamp="{utc_time}-{cdash_build_group}" Name="{hostname}" Generator="ctest3.0.0">
 <Upload>
-<File filename="{}">
+<File filename="{str((tmp_path / tarball).absolute())}">
 <Content encoding="base64">
-{}
+{base64}
 </Content>
 </File>
 </Upload>
 </Site>
-""".format(
-                cdash_build_name,
-                utc_time,
-                cdash_build_group,
-                hostname,
-                os.path.abspath(tarball),
-                base64,
-            )
+"""
 
-            with open(os.path.join(data_rel_path, "Upload.xml"), "w") as fd:
-                fd.write(xml_text)
-
-    finally:
-        if os.path.isdir(log_dir):
-            shutil.rmtree(log_dir)
+        with (data_rel_path / "Upload.xml").open(mode="w") as fd:
+            fd.write(xml_text)
 
 
 ###############################################################################
 def create_cdash_xml(
-    results, cdash_build_name, cdash_project, cdash_build_group, force_log_upload=False
+    results,
+    cdash_build_name,
+    cdash_project,
+    cdash_build_group,
+    force_log_upload=False,
+    cdash_tmproot=None,
 ):
     ###############################################################################
 
@@ -479,88 +447,135 @@ def create_cdash_xml(
     if hostname is None:
         hostname = socket.gethostname().split(".")[0]
         logging.warning(
-            "Could not convert hostname '{}' into an E3SM machine name".format(hostname)
+            f"Could not convert hostname '{hostname}' into an E3SM machine name"
         )
 
-    for drop_method in ["https", "http"]:
-        dart_config = """
-SourceDirectory: {0}
-BuildDirectory: {0}
+    # We assume all cases were created from the same code repo
+    first_result_case = os.path.dirname(list(results.items())[0][1][0])
+    try:
+        srcroot = run_cmd_no_fail(
+            "./xmlquery --value SRCROOT", from_dir=first_result_case
+        )
+    except CIMEError:
+        # Use repo containing this script as last resort
+        srcroot = os.path.join(CIME.utils.get_cime_root(), "..")
+
+    git_commit = CIME.utils.get_current_commit(repo=srcroot)
+
+    # Get total elapsed time
+    if "JENKINS_START_TIME" in os.environ:
+        time_info = int(current_time) - int(os.environ["JENKINS_START_TIME"])
+    else:
+        time_info = "unknown"
+
+    if cdash_tmproot:
+        tmproots = [cdash_tmproot]
+    else:
+        tmproots = [None, first_result_case, os.getcwd()]
+
+    # Try multiple tmproots if necessary. The default /tmp will be tried first
+    # unless cdash_tmproot was provided. The location of the default can be
+    # modified via the TMPDIR environment variable.
+    for tmproot in tmproots:
+        try:
+            with tempfile.TemporaryDirectory(dir=tmproot) as tmpdir:
+                tmp_path = Path(tmpdir)
+                utc_time = time.strftime("%Y%m%d-%H%M", utc_time_tuple)
+                dart_path = tmp_path / "DartConfiguration.tcl"
+                testing_path = tmp_path / "Testing"
+                testtime_dir = testing_path / utc_time  # Most action happens here
+                tag_file = testing_path / "TAG"
+                notes_file = tmp_path / "notes.txt"
+
+                testtime_dir.mkdir(parents=True)
+
+                # Make tag file
+                with tag_file.open(mode="w") as tag_fd:
+                    tag_fd.write(f"{utc_time}\n{cdash_build_group}\n")
+
+                # Make notes file
+                with notes_file.open(mode="w") as notes_fd:
+                    notes_fd.write(
+                        f"Commit {git_commit}\nTotal testing time {time_info} seconds\n"
+                    )
+
+                create_cdash_xml_fakes(
+                    results,
+                    cdash_build_name,
+                    cdash_build_group,
+                    utc_time,
+                    current_time,
+                    hostname,
+                    testtime_dir,
+                )
+
+                create_cdash_upload_xml(
+                    results,
+                    cdash_build_name,
+                    cdash_build_group,
+                    utc_time,
+                    hostname,
+                    force_log_upload,
+                    tmp_path,
+                    testtime_dir,
+                )
+
+                for drop_method in ["https", "http"]:
+                    dart_config = f"""
+SourceDirectory: {str(tmp_path.absolute())}
+BuildDirectory: {str(tmp_path.absolute())}
 
 # Site is something like machine.domain, i.e. pragmatic.crd
-Site: {1}
+Site: {hostname}
 
 # Build name is osname-revision-compiler, i.e. Linux-2.4.2-2smp-c++
-BuildName: {2}
+BuildName: {cdash_build_name}
 
 # Submission information
 IsCDash: TRUE
 CDashVersion:
 QueryCDashVersion:
 DropSite: my.cdash.org
-DropLocation: /submit.php?project={3}
+DropLocation: /submit.php?project={cdash_project}
 DropSiteUser:
 DropSitePassword:
 DropSiteMode:
-DropMethod: {6}
+DropMethod: {drop_method}
 TriggerSite:
-ScpCommand: {4}
+ScpCommand: {shutil.which('scp')}
 
 # Dashboard start time
-NightlyStartTime: {5} UTC
+NightlyStartTime: {cdash_timestamp} UTC
 
 UseLaunchers:
 CurlOptions: CURLOPT_SSL_VERIFYPEER_OFF;CURLOPT_SSL_VERIFYHOST_OFF
-""".format(
-            os.getcwd(),
-            hostname,
-            cdash_build_name,
-            cdash_project,
-            shutil.which("scp"),
-            cdash_timestamp,
-            drop_method,
-        )
+"""
+                    with dart_path.open(mode="w") as dart_fd:
+                        dart_fd.write(dart_config)
 
-        with open("DartConfiguration.tcl", "w") as dart_fd:
-            dart_fd.write(dart_config)
+                    stat, out, _ = run_cmd(
+                        "ctest -VV -D NightlySubmit -A notes.txt",
+                        combine_output=True,
+                        from_dir=str(tmp_path),
+                    )
+                    if stat != 0:
+                        logging.warning(
+                            f"ctest upload drop method {drop_method} FAILED:\n{out}"
+                        )
+                    else:
+                        logging.info(f"Upload SUCCESS:\n{out}")
+                        if ENV_VAR_KEEP_CDASH in os.environ:
+                            logging.info(
+                                f"Test mode enabled, copying {str(tmp_path)} to {os.getcwd()}"
+                            )
+                            safe_copy(str(tmp_path / "Testing"), os.getcwd())
 
-        utc_time = time.strftime("%Y%m%d-%H%M", utc_time_tuple)
-        testing_dir = os.path.join("Testing", utc_time)
-        if os.path.isdir(testing_dir):
-            shutil.rmtree(testing_dir)
+                        return
 
-        os.makedirs(os.path.join("Testing", utc_time))
-
-        # Make tag file
-        with open("Testing/TAG", "w") as tag_fd:
-            tag_fd.write("{}\n{}\n".format(utc_time, cdash_build_group))
-
-        create_cdash_xml_fakes(
-            results,
-            cdash_build_name,
-            cdash_build_group,
-            utc_time,
-            current_time,
-            hostname,
-        )
-
-        create_cdash_upload_xml(
-            results,
-            cdash_build_name,
-            cdash_build_group,
-            utc_time,
-            hostname,
-            force_log_upload,
-        )
-
-        stat, out, _ = run_cmd("ctest -VV -D NightlySubmit", combine_output=True)
-        if stat != 0:
+        except Exception as e:
             logging.warning(
-                "ctest upload drop method {} FAILED:\n{}".format(drop_method, out)
+                f"Using temp root '{tmproot}', cdash submission failed with error {e}"
             )
-        else:
-            logging.info("Upload SUCCESS:\n{}".format(out))
-            return
 
     expect(False, "All cdash upload attempts failed")
 
@@ -583,7 +598,7 @@ def wait_for_test(
     else:
         test_status_filepath = test_path
 
-    logging.debug("Watching file: '{}'".format(test_status_filepath))
+    logging.debug(f"Watching file: '{test_status_filepath}'")
     test_log_path = os.path.join(
         os.path.dirname(test_status_filepath), ".internal_test_status.log"
     )
@@ -614,7 +629,7 @@ def wait_for_test(
 
                 if prior_ts is not None and prior_ts != ts:
                     log_fd.write(ts.phase_statuses_dump())
-                    log_fd.write("OVERALL: {}\n\n".format(test_status))
+                    log_fd.write(f"OVERALL: {test_status}\n\n")
 
                 prior_ts = ts
 
@@ -627,9 +642,7 @@ def wait_for_test(
 
             else:
                 if wait and not SIGNAL_RECEIVED:
-                    logging.debug(
-                        "File '{}' does not yet exist".format(test_status_filepath)
-                    )
+                    logging.debug(f"File '{test_status_filepath}' does not yet exist")
                     time.sleep(SLEEP_INTERVAL_SEC)
                 else:
                     test_name = os.path.abspath(test_status_filepath).split("/")[-2]
@@ -637,7 +650,7 @@ def wait_for_test(
                         (
                             test_name,
                             test_path,
-                            "File '{}' doesn't exist".format(test_status_filepath),
+                            f"File '{test_status_filepath}' doesn't exist",
                             CREATE_NEWCASE_PHASE,
                         )
                     )
@@ -689,29 +702,23 @@ def wait_for_tests_impl(
             prior_path, prior_status, _ = test_results[test_name]
             if test_status == prior_status:
                 logging.warning(
-                    "Test name '{}' was found in both '{}' and '{}'".format(
-                        test_name, test_path, prior_path
-                    )
+                    f"Test name '{test_name}' was found in both '{test_path}' and '{prior_path}'"
                 )
             else:
                 raise CIMEError(
-                    "Test name '{}' was found in both '{}' and '{}' with different results".format(
-                        test_name, test_path, prior_path
-                    )
+                    f"Test name '{test_name}' was found in both '{test_path}' and '{prior_path}' with different results"
                 )
 
         expect(
             test_name is not None,
-            "Failed to get test name for test_path: {}".format(test_path),
+            f"Failed to get test name for test_path: {test_path}",
         )
         test_results[test_name] = (test_path, test_status, test_phase)
         completed_test_paths.append(test_path)
 
     expect(
         set(test_paths) == set(completed_test_paths),
-        "Missing results for test paths: {}".format(
-            set(test_paths) - set(completed_test_paths)
-        ),
+        f"Missing results for test paths: {set(test_paths) - set(completed_test_paths)}",
     )
     return test_results
 
@@ -727,6 +734,7 @@ def wait_for_tests(
     ignore_memleak=False,
     cdash_build_name=None,
     cdash_project=E3SM_MAIN_CDASH,
+    cdash_tmproot=None,
     cdash_build_group=CDASH_DEFAULT_BUILD_GROUP,
     timeout=None,
     force_log_upload=False,
@@ -763,7 +771,7 @@ def wait_for_tests(
             NAMELIST_FAIL_STATUS,
         ]:
             # Report failed phases
-            logging.info("{} {} (phase {})".format(test_status, test_name, phase))
+            logging.info(f"{test_status} {test_name} (phase {phase})")
             all_pass = False
         else:
             # Be cautious about telling the user that the test passed since we might
@@ -771,33 +779,27 @@ def wait_for_tests(
             if test_status == TEST_PEND_STATUS:
                 if expect_test_complete:
                     logging.info(
-                        "{} {} (phase {} unexpectedly left in PEND)".format(
-                            TEST_PEND_STATUS, test_name, phase
-                        )
+                        f"{TEST_PEND_STATUS} {test_name} (phase {phase} unexpectedly left in PEND)"
                     )
                     all_pass = False
                 else:
                     logging.info(
-                        "{} {} (phase {} has not yet completed)".format(
-                            TEST_PEND_STATUS, test_name, phase
-                        )
+                        f"{TEST_PEND_STATUS} {test_name} (phase {phase} has not yet completed)"
                     )
 
             elif test_status == NAMELIST_FAIL_STATUS:
                 logging.info(
-                    "{} {} (but otherwise OK) {}".format(
-                        NAMELIST_FAIL_STATUS, test_name, phase
-                    )
+                    f"{NAMELIST_FAIL_STATUS} {test_name} (but otherwise OK) {phase}"
                 )
                 all_pass = False
             else:
                 expect(
                     test_status == TEST_PASS_STATUS,
-                    "Expected pass if we made it here, instead: {}".format(test_status),
+                    f"Expected pass if we made it here, instead: {test_status}",
                 )
-                logging.info("{} {} {}".format(test_status, test_name, phase))
+                logging.info(f"{test_status} {test_name} {phase}")
 
-        logging.info("    Case dir: {}".format(case_dir))
+        logging.info(f"    Case dir: {case_dir}")
 
         if update_success or (cdash_build_name and not env_loaded):
             try:
@@ -821,9 +823,7 @@ def wait_for_tests(
 
             except CIMEError as e:
                 logging.warning(
-                    "Failed to update success / load_env for Case {}: {}".format(
-                        case_dir, e
-                    )
+                    f"Failed to update success / load_env for Case {case_dir}: {e}"
                 )
 
     if cdash_build_name:
@@ -833,6 +833,7 @@ def wait_for_tests(
             cdash_project,
             cdash_build_group,
             force_log_upload,
+            cdash_tmproot,
         )
 
     return all_pass

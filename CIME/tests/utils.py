@@ -165,43 +165,89 @@ class TestEnv(EntryID):
         return ET.tostring(self.root.xml_element, encoding="unicode", method="xml")
 
 
-def mock_case(*args, empty_env=False, filename=None, mock_set_value=False, **kwargs):
+def mock_case(
+    *args,
+    empty_env=False,
+    filename=None,
+    mock_set_value=False,
+    casename=None,
+    tempdir=None,
+    **kwargs,
+):
     if filename is None:
         filename = "env_test.xml"
 
-    def outer(func):
-        # patch "read_xml" function since the source file usually doesn't exist
-        @mock.patch("CIME.case.case.Case.read_xml")
-        def wrapper(self, read_xml, *args, **kwargs):
-            with tempfile.TemporaryDirectory() as tempdir:
-                caseroot = f"{tempdir}/case"
-                with Case(caseroot, read_only=False) as case:
-                    case.flush = lambda: None
+    if casename is None:
+        casename = "case"
 
-                    env = TestEnv()
-                    env.filename = f"{os.getcwd()}/{filename}"
+    with contextlib.ExitStack() as stack:
+        if tempdir is None:
+            tempdir = stack.enter_context(tempfile.TemporaryDirectory())
 
-                    if not empty_env:
-                        case._files = [env]
+        def outer(func):
+            # patch "read_xml" function since the source file usually doesn't exist
+            @mock.patch("CIME.case.case.Case.read_xml")
+            def wrapper(self, read_xml, *args, **kwargs):
+                caseroot = f"{tempdir}/{casename}"
 
-                        case._env_entryid_files = [env]
+                case = stack.enter_context(Case(caseroot, read_only=False))
+                case.flush = lambda: None
 
-                    if mock_set_value:
-                        case.set_value = mock.MagicMock()
+                env = TestEnv()
+                env.filename = f"{os.getcwd()}/{filename}"
 
-                    func(
-                        self,
-                        *args,
-                        **kwargs,
-                        case_read_xml=read_xml,
-                        test_env=env,
-                        caseroot=caseroot,
-                        case=case,
-                    )
+                if not empty_env:
+                    case._files = [env]
+
+                    case._env_entryid_files = [env]
+
+                if mock_set_value:
+                    case.set_value = mock.MagicMock()
+
+                #
+                if self is None:
+                    return read_xml, env, caseroot, casename, case
+
+                func(
+                    self,
+                    *args,
+                    **kwargs,
+                    case_read_xml=read_xml,
+                    test_env=env,
+                    caseroot=caseroot,
+                    case=case,
+                )
+
+            # not wrapping function
+            if func is None:
+                return wrapper(None)
+
+            return wrapper
+
+        return outer
+
+
+def mock_env(cls, content=None):
+    """Mocks an environment class.
+
+    Args:
+        cls: XML environment class.
+        content: String with the XML to load.
+    """
+
+    def decorator(f):
+        env = cls(read_only=False)
+
+        if content is not None:
+            env.read_only = True
+            env.read_fd(io.StringIO(content))
+
+        def wrapper(self, *args, **kwargs):
+            return f(self, env, *args, **kwargs)
 
         return wrapper
 
-    return outer
+    return decorator
 
 
 @contextlib.contextmanager

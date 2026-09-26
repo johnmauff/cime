@@ -1,10 +1,12 @@
 """
 Functions for actions pertaining to history files.
 """
+
 import logging
 import os
 import re
 import filecmp
+import shutil
 
 from CIME.XML.standard_module_setup import *
 from CIME.config import Config
@@ -16,7 +18,7 @@ from CIME.utils import (
     SharedArea,
     parse_test_name,
 )
-from CIME.utils import CIMEError
+from CIME.core.exceptions import CIMEError
 
 logger = logging.getLogger(__name__)
 
@@ -101,7 +103,7 @@ def copy_histfiles(case, suffix, match_suffix=None):
                 if "ocean_geometry" in test_hist:
                     comments += "    skipping '{}'\n".format(test_hist)
                     continue
-                if "mom6.ic" in test_hist:
+                if re.search(r"mom6(_[0-9]{4})?\.ic", os.path.basename(test_hist)):
                     comments += "    skipping '{}'\n".format(test_hist)
                     continue
             comments += "  Copying hist files for model '{}'\n".format(model)
@@ -522,6 +524,7 @@ def cprnc(
             out = fd.read()
 
     comment = ""
+    files_match = False
     if cpr_stat == 0:
         # Successful exit from cprnc
         if multiinst_driver_compare:
@@ -650,6 +653,20 @@ def _generate_baseline_impl(case, baseline_dir=None, allow_baseline_overwrite=Fa
     ):
         expect(False, " Cowardly refusing to overwrite existing baseline directory")
 
+    # Remove stale baseline files from a previous run so they don't linger when the
+    # new run no longer produces them.  CaseDocs and user_nl* are managed by the
+    # namelist-generation phase (which already ran), so we preserve those.
+    preserve_list = ["CaseDocs", BLESS_LOG_NAME, TEST_STATUS_FILENAME]
+    if os.path.isdir(basegen_dir):
+        for item in os.listdir(basegen_dir):
+            if item in preserve_list or item.startswith("user_nl"):
+                continue
+            item_path = os.path.join(basegen_dir, item)
+            if os.path.isfile(item_path):
+                os.remove(item_path)
+            elif os.path.isdir(item_path):
+                shutil.rmtree(item_path)
+
     comments = "Generating baselines into '{}'\n".format(basegen_dir)
     num_gen = 0
     for model in _iter_model_file_substrs(case):
@@ -770,13 +787,19 @@ def get_ts_synopsis(comments):
     'ERROR Could not interpret CPRNC output'
     >>> get_ts_synopsis('file1=\nfile2=\n  diff_test: the two files seem to be IDENTICAL \n')
     ''
+    >>> get_ts_synopsis('Comparing hists\nPASS\n  Most recent bless: sha:abc\n')
+    ''
     """
     comments = comments.strip()
 
     if comments == "" or "\n" not in comments:
         return comments
 
-    if comments.endswith("PASS"):
+    # Comparison passed if a line consisting of exactly "PASS" appears.
+    # _compare_hists writes this token verbatim; any other casing (Pass, pass,
+    # PASSING, ...) is not a status marker and must fall through. The optional
+    # \r tolerates CRLF line endings without weakening the exact-match check.
+    if re.search(r"^PASS\r?$", comments, re.MULTILINE):
         return ""
 
     # Empty synopsis when files are identicial

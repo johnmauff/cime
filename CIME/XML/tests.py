@@ -1,10 +1,12 @@
 """
 Interface to the config_tests.xml file.  This class inherits from GenericEntry
 """
+
 from CIME.XML.standard_module_setup import *
 
 from CIME.XML.generic_xml import GenericXML
 from CIME.XML.files import Files
+from CIME.core.exceptions import CIMEError
 from CIME.utils import find_system_test
 from CIME.SystemTests.system_tests_compare_two import SystemTestsCompareTwo
 from CIME.SystemTests.system_tests_compare_n import SystemTestsCompareN
@@ -59,8 +61,7 @@ class Tests(GenericXML):
 
         if not valid:
             case_base_id = case.get_value("CASEBASEID")
-
-            raise Exception(
+            raise CIMEError(
                 f"{case_base_id} does not support the '--single-exe' option as it requires separate builds"
             )
 

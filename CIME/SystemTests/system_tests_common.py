@@ -26,7 +26,7 @@ from CIME.hist_utils import (
     generate_baseline,
 )
 from CIME.config import Config
-from CIME.provenance import save_test_time, get_test_success
+from CIME.provenance import save_test_time
 from CIME.locked_files import LOCKED_DIR, lock_file, is_locked
 from CIME.baselines.performance import (
     get_latest_cpl_logs,
@@ -119,6 +119,7 @@ class SystemTestsCommon(object):
         self._ninja = False
         self._dry_run = False
         self._user_separate_builds = False
+        self._batched_build_active = False
         self._expected_num_cmp = None
         self._rest_n = None
         sc_file = os.path.join(caseroot, "shell_commands")
@@ -185,6 +186,8 @@ class SystemTestsCommon(object):
         elif ncpl_base_period == "decade":
             coupling_secs = 315360000 / maxncpl
             timestep = 315360000 / minncpl
+        else:
+            raise CIMEError("unhandled ncpl_base_period value")
 
         # Convert stop_n to units of coupling intervals
         factor = 1
@@ -265,6 +268,7 @@ class SystemTestsCommon(object):
         elif stop_option == "nyears":
             rtd = timedelta(days=rest_n * 365)
         else:
+            rtd = None
             expect(False, f"stop_option {stop_option} not available for this test")
 
         restdatetime = startdatetime + rtd
@@ -416,6 +420,7 @@ class SystemTestsCommon(object):
         dry_run=False,
         separate_builds=False,
         skip_submit=False,
+        batched_build_active=False,
     ):
         """
         Do NOT override this method, this method is the framework that
@@ -426,6 +431,7 @@ class SystemTestsCommon(object):
         self._ninja = ninja
         self._dry_run = dry_run
         self._user_separate_builds = separate_builds
+        self._batched_build_active = batched_build_active
 
         was_run_pend = self._test_status.current_is(RUN_PHASE, TEST_PEND_STATUS)
 
@@ -440,10 +446,18 @@ class SystemTestsCommon(object):
 
                 start_time = time.time()
                 try:
-                    self.build_phase(
-                        sharedlib_only=(phase_name == SHAREDLIB_BUILD_PHASE),
-                        model_only=(phase_name == MODEL_BUILD_PHASE),
-                    )
+                    if (
+                        not model_only
+                        and not sharedlib_only
+                        and phase_name == SHAREDLIB_BUILD_PHASE
+                    ):
+                        # Fuse!
+                        pass
+                    else:
+                        self.build_phase(
+                            sharedlib_only=sharedlib_only,
+                            model_only=model_only,
+                        )
                 except (
                     BaseException
                 ) as e:  # We want KeyboardInterrupts to generate FAIL status
@@ -504,6 +518,7 @@ class SystemTestsCommon(object):
             ninja=self._ninja,
             dry_run=self._dry_run,
             separate_builds=self._user_separate_builds,
+            batched_build_active=self._batched_build_active,
         )
         logger.info("build_indv complete")
 
@@ -601,61 +616,6 @@ class SystemTestsCommon(object):
                         time_taken,
                         get_current_commit(repo=srcroot),
                     )
-
-                # If overall things did not pass, offer the user some insight into what might have broken things
-                overall_status = self._test_status.get_overall_test_status(
-                    ignore_namelists=True
-                )[0]
-                if overall_status != TEST_PASS_STATUS:
-                    srcroot = self._case.get_value("SRCROOT")
-                    worked_before, last_pass, last_fail_transition = get_test_success(
-                        baseline_root, srcroot, self._casebaseid
-                    )
-
-                    if worked_before:
-                        if last_pass is not None:
-                            # commits between last_pass and now broke things
-                            stat, out, err = run_cmd(
-                                "git rev-list --first-parent {}..{}".format(
-                                    last_pass, "HEAD"
-                                ),
-                                from_dir=srcroot,
-                            )
-                            if stat == 0:
-                                append_testlog(
-                                    "NEW FAIL: Potentially broken merges:\n{}".format(
-                                        out
-                                    ),
-                                    self._orig_caseroot,
-                                )
-                            else:
-                                logger.warning(
-                                    "Unable to list potentially broken merges: {}\n{}".format(
-                                        out, err
-                                    )
-                                )
-                    else:
-                        if last_pass is not None and last_fail_transition is not None:
-                            # commits between last_pass and last_fail_transition broke things
-                            stat, out, err = run_cmd(
-                                "git rev-list --first-parent {}..{}".format(
-                                    last_pass, last_fail_transition
-                                ),
-                                from_dir=srcroot,
-                            )
-                            if stat == 0:
-                                append_testlog(
-                                    "OLD FAIL: Potentially broken merges:\n{}".format(
-                                        out
-                                    ),
-                                    self._orig_caseroot,
-                                )
-                            else:
-                                logger.warning(
-                                    "Unable to list potentially broken merges: {}\n{}".format(
-                                        out, err
-                                    )
-                                )
 
             if config.baseline_store_teststatus and self._case.get_value(
                 "GENERATE_BASELINE"
@@ -1022,11 +982,16 @@ for some of your components.
             ts_comments = (
                 os.path.dirname(baseline_name) + ": " + get_ts_synopsis(comments)
             )
+            log_comments = "\n\n============ BASELINE COMPARE SYNOPSIS =============\n"
+            log_comments += ts_comments + "\n"
+            log_comments += "====================================================\n"
+            append_testlog(log_comments, self._orig_caseroot)
             self._test_status.set_status(BASELINE_PHASE, status, comments=ts_comments)
 
     def _generate_baseline(self):
         """
-        generate a new baseline case based on the current test
+        If you find yourself wanting to override this method, check whether you can accomplish what
+        you want using additional_baseline_generation() instead.
         """
         with self._test_status:
             # generate baseline
@@ -1034,9 +999,6 @@ for some of your components.
             append_testlog(comments, self._orig_caseroot)
             status = TEST_PASS_STATUS if success else TEST_FAIL_STATUS
             baseline_name = self._case.get_value("BASEGEN_CASE")
-            self._test_status.set_status(
-                GENERATE_PHASE, status, comments=os.path.dirname(baseline_name)
-            )
             basegen_dir = os.path.join(
                 self._case.get_value("BASELINE_ROOT"),
                 self._case.get_value("BASEGEN_CASE"),
@@ -1059,6 +1021,21 @@ for some of your components.
                         )
 
                         perf_write_baseline(self._case, basegen_dir, cpllog)
+
+                self.additional_baseline_generation(basegen_dir)
+
+            self._test_status.set_status(
+                GENERATE_PHASE, status, comments=os.path.dirname(baseline_name)
+            )
+
+    def additional_baseline_generation(
+        self, basegen_dir
+    ):  # pylint: disable=unused-argument
+        """
+        Extension point for subclasses to perform additional operations during baseline generation
+        phase.
+        """
+        return
 
 
 def perf_check_for_memory_leak(case, tolerance):
@@ -1135,7 +1112,29 @@ class FakeTest(SystemTestsCommon):
 
             with open(modelexe, "w") as f:
                 f.write("#!/bin/bash\n")
+
+                # We most likely only want one of the cpus to move files around etc
+                f.write(
+                    """
+if [ -n "$OMPI_COMM_WORLD_RANK" ]; then
+    MY_RANK=$OMPI_COMM_WORLD_RANK
+elif [ -n "$PMI_RANK" ]; then
+    MY_RANK=$PMI_RANK
+elif [ -n "$SLURM_PROCID" ]; then
+    MY_RANK=$SLURM_PROCID
+elif [ -n "$MV2_COMM_WORLD_RANK" ]; then
+    MY_RANK=$MV2_COMM_WORLD_RANK
+else
+    # Default to 0 if running locally or outside an MPI launcher
+    MY_RANK=0
+fi
+
+# This block only runs on the MASTER processor (Rank 0)
+if [ "$MY_RANK" -eq 0 ]; then
+"""
+                )
                 f.write(self._script)
+                f.write("\nfi\n")
 
             os.chmod(modelexe, 0o755)
 
@@ -1299,12 +1298,12 @@ class TESTRUNFAILRESET(TESTRUNFAIL):
 
 class TESTRUNFAILEXC(TESTRUNPASS):
     def run_phase(self):
-        raise RuntimeError("Exception from run_phase")
+        raise CIMEError("Exception from run_phase")
 
 
 class TESTRUNSTARCFAIL(TESTRUNPASS):
     def _st_archive_case_test(self):
-        raise RuntimeError("Exception from st archive")
+        raise CIMEError("Exception from st archive")
 
 
 class TESTBUILDFAIL(TESTRUNPASS):
@@ -1326,7 +1325,7 @@ class TESTBUILDFAIL(TESTRUNPASS):
 
 class TESTBUILDFAILEXC(FakeTest):
     def build_phase(self, sharedlib_only=False, model_only=False):
-        raise RuntimeError("Exception from build")
+        raise CIMEError("Exception from build")
 
 
 class TESTRUNUSERXMLCHANGE(FakeTest):
