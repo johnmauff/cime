@@ -6,10 +6,23 @@ of the tests in one or more test suites
 from __future__ import print_function
 from CIME.XML.standard_module_setup import *
 from CIME.XML.expected_fails_file import ExpectedFailsFile
-from CIME.test_status import TestStatus, SHAREDLIB_BUILD_PHASE, TEST_PEND_STATUS
+from CIME.test_status import (
+    TestStatus,
+    SHAREDLIB_BUILD_PHASE,
+    RUN_PHASE,
+    TEST_PEND_STATUS,
+    TEST_PASS_STATUS,
+    TEST_FAIL_STATUS,
+)
+from CIME.case.case_run import TERMINATION_TEXT
+import gzip
 import os
+import re
 import sys
 from collections import defaultdict
+
+# A run log: <component>.log.<lid>, possibly gzipped.
+_RUN_LOG_RE = re.compile(r"^\w+\.log\.(?P<lid>.+?)(\.gz)?$")
 
 
 def cs_status(
@@ -22,6 +35,7 @@ def cs_status(
     expected_fails_filepath=None,
     force_rebuild=False,
     out=sys.stdout,
+    run_dir_lookup=None,
 ):
     """Print the test statuses of all tests in test_paths. The default
     is to print to stdout, but this can be overridden with the 'out'
@@ -42,6 +56,14 @@ def cs_status(
     If expected_fails_filepath is provided, it should be a string giving
     the full path to a file listing expected failures for this test
     suite. Expected failures are then labeled as such in the output.
+
+    A RUN phase recorded as PASS is re-checked against the run logs: if no
+    log of the newest run contains a termination message, RUN is reported
+    as FAIL (the TestStatus file is not changed). The recorded PASS can be
+    wrong when the MPI launcher hides an abort's exit status and the
+    post-run check only finds a non-empty component log.
+    run_dir_lookup maps a test directory to its run directory (default:
+    the case's RUNDIR); None from it skips the check.
     """
     expect(not (summary and fails_only), "Cannot have both summary and fails_only")
     expect(
@@ -54,6 +76,8 @@ def cs_status(
     xfails = _get_xfails(expected_fails_filepath)
     test_id_output = defaultdict(str)
     test_id_counts = defaultdict(int)
+    if run_dir_lookup is None:
+        run_dir_lookup = _case_run_dir
     for test_path in test_paths:
         test_dir = os.path.dirname(test_path)
         ts = TestStatus(test_dir=test_dir)
@@ -61,6 +85,11 @@ def cs_status(
         if force_rebuild:
             with ts:
                 ts.set_status(SHAREDLIB_BUILD_PHASE, TEST_PEND_STATUS)
+
+        if ts.get_status(RUN_PHASE) == TEST_PASS_STATUS:
+            problem = _unterminated_run(run_dir_lookup(test_dir))
+            if problem is not None:
+                ts.override_status(RUN_PHASE, TEST_FAIL_STATUS, problem)
 
         test_id = os.path.basename(test_dir).split(".")[-1]
         if summary:
@@ -102,6 +131,53 @@ def cs_status(
         print("Non-PASS results for select phases:", file=out)
         for phase in count_fails_phase_list:
             print("{} non-passes: {}".format(phase, non_pass_counts[phase]), file=out)
+
+
+def _case_run_dir(test_dir):
+    """Returns the RUNDIR of the case in test_dir, or None if it can't be read."""
+    if not os.path.isfile(os.path.join(test_dir, "env_run.xml")):
+        return None
+    try:
+        from CIME.case import Case
+
+        with Case(test_dir, read_only=True) as case:
+            return case.get_value("RUNDIR")
+    except Exception:  # pylint: disable=broad-except
+        return None
+
+
+def _unterminated_run(run_dir):
+    """Checks that the newest run in run_dir terminated.
+
+    Args:
+        run_dir (str or None): The run directory.
+
+    Returns:
+        str or None: Why the run is not known to have terminated, or None if
+        a log of the newest run contains a termination message, or if there
+        is nothing to check (no run directory or no run logs).
+    """
+    if run_dir is None or not os.path.isdir(run_dir):
+        return None
+    logs = {}
+    for name in os.listdir(run_dir):
+        match = _RUN_LOG_RE.match(name)
+        if match:
+            logs[os.path.join(run_dir, name)] = match.group("lid")
+    if not logs:
+        return None
+    lid = logs[max(logs, key=os.path.getmtime)]
+    for path, log_lid in logs.items():
+        if log_lid != lid:
+            continue
+        opener = gzip.open if path.endswith(".gz") else open
+        with opener(path, "rt", errors="replace") as fd:
+            text = fd.read()
+        if any(marker in text for marker in TERMINATION_TEXT):
+            return None
+    return "TestStatus says PASS, but no log of run {} contains a termination message".format(
+        lid
+    )
 
 
 def _get_xfails(expected_fails_filepath):

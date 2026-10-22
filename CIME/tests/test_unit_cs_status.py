@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 
+import gzip
 import io
 import unittest
 import shutil
@@ -296,6 +297,114 @@ class TestCsStatus(CustomAssertionsTestStatus):
         self.assert_num_expected_unexpected_fails(
             self._output.getvalue(), num_expected=1, num_unexpected=0
         )
+
+
+# ----------------------------------------------------------------------------
+# RUN PASS re-checked against the run logs
+# ----------------------------------------------------------------------------
+
+_TEST_NAME = "SMS.f19_g16.A.mach_comp"
+
+
+def _make_test(tmp_path, run_status=test_status.TEST_PASS_STATUS):
+    """A test directory whose TestStatus has every core phase PASS, with RUN
+    set to run_status. Returns (test_dir, run_dir)."""
+    test_dir = tmp_path / "{}.testid".format(_TEST_NAME)
+    run_dir = tmp_path / "run"
+    test_dir.mkdir()
+    run_dir.mkdir()
+    with test_status.TestStatus(test_dir=str(test_dir), test_name=_TEST_NAME) as ts:
+        for phase in test_status.CORE_PHASES:
+            ts.set_status(phase, test_status.TEST_PASS_STATUS)
+        ts.set_status(test_status.MEMLEAK_PHASE, test_status.TEST_PASS_STATUS)
+    if run_status != test_status.TEST_PASS_STATUS:
+        with test_status.TestStatus(test_dir=str(test_dir)) as ts:
+            ts.set_status(test_status.RUN_PHASE, run_status)
+    return test_dir, run_dir
+
+
+def _write_log(run_dir, name, text, mtime, compress=False):
+    path = run_dir / name
+    if compress:
+        with gzip.open(str(path), "wt") as fd:
+            fd.write(text)
+    else:
+        path.write_text(text)
+    os.utime(str(path), (mtime, mtime))
+
+
+def _status(test_dir, run_dir):
+    out = io.StringIO()
+    cs_status(
+        [str(test_dir / "TestStatus")],
+        out=out,
+        run_dir_lookup=lambda _: None if run_dir is None else str(run_dir),
+    )
+    return out.getvalue()
+
+
+def _run_line(output):
+    """The RUN phase line of cs_status' detailed output."""
+    return next(line for line in output.splitlines() if line.split()[2:3] == ["RUN"])
+
+
+def test_run_pass_with_termination_message_stays_pass(tmp_path):
+    test_dir, run_dir = _make_test(tmp_path)
+    _write_log(run_dir, "atm.log.1.a", "...\n END OF MODEL RUN\n", 100)
+    _write_log(run_dir, "cesm.log.1.a", "...\n", 100)
+    output = _status(test_dir, run_dir)
+    assert _run_line(output).split()[0] == test_status.TEST_PASS_STATUS
+    assert "(Overall: PASS)" in output
+
+
+def test_run_pass_without_termination_message_reported_as_fail(tmp_path):
+    test_dir, run_dir = _make_test(tmp_path)
+    _write_log(run_dir, "atm.log.1.a", "reading fields\n", 100, compress=True)
+    _write_log(run_dir, "cesm.log.1.a", "MPI_Abort\n", 100, compress=True)
+    before = (test_dir / "TestStatus").read_text()
+
+    output = _status(test_dir, run_dir)
+
+    line = _run_line(output)
+    assert line.split()[0] == test_status.TEST_FAIL_STATUS
+    assert "no log of run 1.a contains a termination message" in line
+    assert "(Overall: FAIL)" in output
+    # Later phases are still reported, and the file is unchanged.
+    assert "{} {}".format(_TEST_NAME, test_status.MEMLEAK_PHASE) in output
+    assert (test_dir / "TestStatus").read_text() == before
+
+
+def test_only_the_newest_run_is_checked(tmp_path):
+    test_dir, run_dir = _make_test(tmp_path)
+    _write_log(run_dir, "atm.log.1.old", "crashed\n", 100)
+    _write_log(run_dir, "drv.log.2.new", "SUCCESSFUL TERMINATION\n", 200)
+    assert _run_line(_status(test_dir, run_dir)).split()[0] == "PASS"
+
+    _write_log(run_dir, "atm.log.3.newest", "crashed\n", 300)
+    assert _run_line(_status(test_dir, run_dir)).split()[0] == "FAIL"
+
+
+def test_nothing_to_check_leaves_run_pass(tmp_path):
+    test_dir, run_dir = _make_test(tmp_path)
+    # No run directory known, then a run directory with no logs.
+    assert _run_line(_status(test_dir, None)).split()[0] == "PASS"
+    assert _run_line(_status(test_dir, run_dir)).split()[0] == "PASS"
+
+
+def test_run_fail_is_not_rechecked(tmp_path):
+    test_dir, run_dir = _make_test(tmp_path, run_status=test_status.TEST_FAIL_STATUS)
+    _write_log(run_dir, "atm.log.1.a", "END OF MODEL RUN\n", 100)
+    assert _run_line(_status(test_dir, run_dir)).split()[0] == "FAIL"
+
+
+def test_override_status_keeps_later_phases_and_never_writes(tmp_path):
+    test_dir, _ = _make_test(tmp_path)
+    before = (test_dir / "TestStatus").read_text()
+    with test_status.TestStatus(test_dir=str(test_dir)) as ts:
+        ts.override_status(test_status.RUN_PHASE, test_status.TEST_FAIL_STATUS, "why")
+        assert ts.get_status(test_status.MEMLEAK_PHASE) == test_status.TEST_PASS_STATUS
+        assert ts.get_comment(test_status.RUN_PHASE) == "why"
+    assert (test_dir / "TestStatus").read_text() == before
 
 
 if __name__ == "__main__":

@@ -268,6 +268,23 @@ class TestStatus(object):
             next_core_phase = CORE_PHASES[CORE_PHASES.index(phase) + 1]
             self._phase_statuses[next_core_phase] = (TEST_PEND_STATUS, "")
 
+    def override_status(self, phase, status, comments=""):
+        """Change the status of one recorded phase in memory only.
+
+        Unlike set_status, later phases are kept and nothing is written back
+        to the TestStatus file, now or later: for tools that report a status
+        they have re-checked, such as cs.status.
+
+        Args:
+            phase (str): A phase already recorded for this test.
+            status (str): The status to report.
+            comments (str): Why the status differs from the file.
+        """
+        expect(phase in self._phase_statuses, "Phase '{}' not recorded".format(phase))
+        expect(status in ALL_PHASE_STATUSES, "Invalid status '{}'".format(status))
+        self._phase_statuses[phase] = (status, comments)
+        self._no_io = True
+
     def get_status(self, phase):
         return self._phase_statuses[phase][0] if phase in self._phase_statuses else None
 
