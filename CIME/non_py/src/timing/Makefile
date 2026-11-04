@@ -81,14 +81,17 @@ libgptl.a: $(OBJS)
 
 
 
+# $(ACC_OFF_FLAG) (nvhpc: -noacc; empty elsewhere, from Macros.make): without it
+# the Cray wrappers add OpenACC when CRAY_ACCEL_TARGET is set in the build
+# environment, and a CPU case then fails to link (undefined __acc_compiled).
 .c.o:
-	$(CC) -c $(INCLDIR) $(INCS) $(CFLAGS) $(CPPDEFS) $<
+	$(CC) -c $(INCLDIR) $(INCS) $(CFLAGS) $(CPPDEFS) $(ACC_OFF_FLAG) $<
 .F.o:
-	$(FC) -c $(INCLDIR) $(INCS) $(FFLAGS) $(FPPDEFS) $(FIXEDFLAGS) $<
+	$(FC) -c $(INCLDIR) $(INCS) $(FFLAGS) $(FPPDEFS) $(FIXEDFLAGS) $(ACC_OFF_FLAG) $<
 .f90.o:
-	$(FC) -c $(INCLDIR) $(INCS) $(FFLAGS) $(FREEFLAGS)  $<
+	$(FC) -c $(INCLDIR) $(INCS) $(FFLAGS) $(FREEFLAGS) $(ACC_OFF_FLAG) $<
 .F90.o:
-	$(FC) -c $(INCLDIR) $(INCS) $(FFLAGS) $(FPPDEFS) $(FREEFLAGS)  $<
+	$(FC) -c $(INCLDIR) $(INCS) $(FFLAGS) $(FPPDEFS) $(FREEFLAGS) $(ACC_OFF_FLAG) $<
 
 mostlyclean:
 	$(RM) -f *.f *.f90

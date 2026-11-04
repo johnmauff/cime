@@ -605,6 +605,8 @@ ifdef MPAS_LIBDIR
 # (ACC_OFF_FLAG is deliberately left undefined/empty for gnu/intel in their own cmake_macros/*.cmake,
 # same idiom OPENACC_GPU_FLAGS already uses) -- a hardcoded -noacc broke gnu/intel MPAS builds
 # outright ("gfortran: error: unrecognized command-line option '-noacc'").
+# MPAS's C files (ezxml.c, xml_stream_parser.c, ...) get no flags from MPAS's
+# own Makefiles, so CC carries $(ACC_OFF_FLAG) for the same reason.
 ifeq ($(MPAS_DYCORE_GPU_OFFLOAD),TRUE)
   MPAS_ACC_FFLAGS := $(OPENACC_GPU_FLAGS)
 else
@@ -612,7 +614,7 @@ else
 endif
 
 libmpas: cam_abortutils.o physconst.o
-	$(MAKE) -C $(MPAS_LIBDIR) CC="$(CC)" FC="$(FC)" PIODEF="$(PIODEF)" \
+	$(MAKE) -C $(MPAS_LIBDIR) CC="$(CC) $(ACC_OFF_FLAG)" FC="$(FC)" PIODEF="$(PIODEF)" \
 	FFLAGS='$(FREEFLAGS) $(FFLAGS) $(MPAS_ACC_FFLAGS)' OPENACC_GPU_FLAGS='$(OPENACC_GPU_FLAGS)' \
 	CASEROOT='$(CASEROOT)' COMPILER='$(COMPILER)' MACH='$(MACH)' \
 	FCINCLUDES='$(INCLDIR) $(INCS) -I$(ABS_INSTALL_SHAREDPATH)/include -I$(ABS_ESMF_PATH)/include'
