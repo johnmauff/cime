@@ -407,5 +407,171 @@ def test_override_status_keeps_later_phases_and_never_writes(tmp_path):
     assert (test_dir / "TestStatus").read_text() == before
 
 
+
+# ----------------------------------------------------------------------------
+# CPU/GPU comparison of history files (COMPARE_cpu_gpu)
+# ----------------------------------------------------------------------------
+
+_GPU_NAME = "SMS_Ln9.ne3pg3.FKESSLER.derecho_nvhpc.cam-outfrq_se_cslam_gpu"
+_CPU_NAME = "SMS_Ln9.ne3pg3.FKESSLER.derecho_nvhpc.cam-outfrq_se_cslam"
+
+
+def _make_case(tmp_path, name, test_id, history, run_status="PASS"):
+    """A finished test with history files {tail: content}; returns test_dir."""
+    test_dir = tmp_path / "{}.{}".format(name, test_id)
+    run_dir = test_dir / "run"
+    run_dir.mkdir(parents=True)
+    with test_status.TestStatus(test_dir=str(test_dir), test_name=name) as ts:
+        for phase in test_status.CORE_PHASES:
+            ts.set_status(phase, test_status.TEST_PASS_STATUS)
+    if run_status != test_status.TEST_PASS_STATUS:
+        with test_status.TestStatus(test_dir=str(test_dir)) as ts:
+            ts.set_status(test_status.RUN_PHASE, run_status)
+    _write_log(run_dir, "atm.log.1.a", "END OF MODEL RUN\n", 100)
+    for tail, content in history.items():
+        (run_dir / "{}.{}.{}".format(name, test_id, tail)).write_text(content)
+    return test_dir
+
+
+def _fake_cprnc(calls):
+    """A cprnc that reports IDENTICAL when the two files have equal content."""
+
+    def cprnc(test_dir, file1, file2):
+        calls.append((os.path.basename(file1), os.path.basename(file2)))
+        with open(file1) as fd1, open(file2) as fd2:
+            if fd1.read() == fd2.read():
+                return "  diff_test: the two files seem to be IDENTICAL\n"
+        return (
+            " RMS T   1.0E-16\n RMS U   2.0E-16\n RMS T   1.0E-16\n"
+            "  diff_test: the two files seem to be DIFFERENT\n"
+        )
+
+    return cprnc
+
+
+def _compare_status(test_dirs, calls=None, **kwargs):
+    out = io.StringIO()
+    cs_status(
+        [str(d / "TestStatus") for d in test_dirs],
+        out=out,
+        run_dir_lookup=lambda d: os.path.join(d, "run"),
+        cprnc=_fake_cprnc([] if calls is None else calls),
+        **kwargs,
+    )
+    return out.getvalue()
+
+
+def _compare_line(output):
+    """The COMPARE_cpu_gpu line of cs_status' output, or None."""
+    return next(
+        (line for line in output.splitlines() if "COMPARE_cpu_gpu" in line), None
+    )
+
+
+_HIST = {"cam.h1i.0001-01-01-00000.nc": "a", "cam.h1i.0001-01-01-01800.nc": "b"}
+
+
+def test_cpu_gpu_identical_history_passes(tmp_path):
+    gpu = _make_case(tmp_path, _GPU_NAME, "x1", _HIST)
+    _make_case(tmp_path, _CPU_NAME, "x1", _HIST)
+    calls = []
+    output = _compare_status([gpu], calls)
+    line = _compare_line(output)
+    assert line.split()[0] == "PASS"
+    assert "vs {}.x1: 2 history files IDENTICAL".format(_CPU_NAME) in line
+    assert len(calls) == 2
+    assert "{} (Overall: PASS)".format(_GPU_NAME) in output
+
+
+def test_cpu_gpu_any_difference_fails_with_fields(tmp_path):
+    gpu = _make_case(tmp_path, _GPU_NAME, "x1", _HIST)
+    changed = dict(_HIST)
+    changed["cam.h1i.0001-01-01-01800.nc"] = "c"
+    _make_case(tmp_path, _CPU_NAME, "x1", changed)
+    output = _compare_status([gpu])
+    line = _compare_line(output)
+    assert line.split()[0] == "FAIL"
+    assert "DIFFERENT 1 of 2 files: cam.h1i.0001-01-01-01800.nc (T, U)" in line
+    assert "(Overall: FAIL)" in output
+
+
+def test_cpu_gpu_missing_history_file_fails(tmp_path):
+    gpu = _make_case(tmp_path, _GPU_NAME, "x1", _HIST)
+    _make_case(tmp_path, _CPU_NAME, "x1", {"cam.h1i.0001-01-01-00000.nc": "a"})
+    line = _compare_line(_compare_status([gpu]))
+    assert line.split()[0] == "FAIL"
+    assert "only GPU ['cam.h1i.0001-01-01-01800.nc']" in line
+
+
+def test_cpu_gpu_no_history_fails(tmp_path):
+    gpu = _make_case(tmp_path, _GPU_NAME, "x1", {})
+    _make_case(tmp_path, _CPU_NAME, "x1", _HIST)
+    line = _compare_line(_compare_status([gpu]))
+    assert line.split()[0] == "FAIL"
+    assert "no history files in the GPU run" in line
+
+
+def test_cpu_gpu_pending_until_both_runs_pass(tmp_path):
+    gpu = _make_case(tmp_path, _GPU_NAME, "x1", _HIST)
+    _make_case(tmp_path, _CPU_NAME, "x1", _HIST, run_status="PEND")
+    calls = []
+    line = _compare_line(_compare_status([gpu], calls))
+    assert line.split()[0] == "PEND"
+    assert "waiting for both runs to PASS" in line
+    assert calls == []
+
+
+def test_cpu_gpu_counterpart_with_another_test_id_among_reported_tests(tmp_path):
+    gpu = _make_case(tmp_path, _GPU_NAME, "s52a", _HIST)
+    cpu = _make_case(tmp_path, _CPU_NAME, "s52e", _HIST)
+    _make_case(tmp_path, _CPU_NAME, "s51e", {})  # not reported: ignored
+    line = _compare_line(_compare_status([gpu, cpu]))
+    assert line.split()[0] == "PASS"
+    assert "vs {}.s52e".format(_CPU_NAME) in line
+
+
+def test_cpu_gpu_without_counterpart_is_pending(tmp_path):
+    gpu = _make_case(tmp_path, _GPU_NAME, "s52a", _HIST)
+    _make_case(tmp_path, _CPU_NAME, "s52e", _HIST)  # other id, not reported
+    line = _compare_line(_compare_status([gpu]))
+    assert line.split()[0] == "PEND"
+    assert "no CPU counterpart {} found".format(_CPU_NAME) in line
+
+
+def test_cpu_gpu_several_counterparts_is_pending(tmp_path):
+    gpu = _make_case(tmp_path, _GPU_NAME, "s52a", _HIST)
+    cpu1 = _make_case(tmp_path, _CPU_NAME, "s51e", _HIST)
+    cpu2 = _make_case(tmp_path, _CPU_NAME, "s52e", _HIST)
+    line = _compare_line(_compare_status([gpu, cpu1, cpu2]))
+    assert line.split()[0] == "PEND"
+    assert "several CPU counterparts" in line
+
+
+def test_cpu_gpu_only_for_gpu_tests_and_can_be_turned_off(tmp_path):
+    gpu = _make_case(tmp_path, _GPU_NAME, "x1", _HIST)
+    cpu = _make_case(tmp_path, _CPU_NAME, "x1", _HIST)
+    calls = []
+    output = _compare_status([cpu], calls)
+    assert _compare_line(output) is None and calls == []
+    assert _compare_line(_compare_status([gpu], compare_cpu_gpu=False)) is None
+
+
+def test_cpu_gpu_compare_never_writes_test_status(tmp_path):
+    gpu = _make_case(tmp_path, _GPU_NAME, "x1", _HIST)
+    _make_case(tmp_path, _CPU_NAME, "x1", _HIST)
+    before = (gpu / "TestStatus").read_text()
+    _compare_status([gpu])
+    assert (gpu / "TestStatus").read_text() == before
+
+
+def test_cpu_test_name_strips_only_the_gpu_testmod_suffix():
+    from CIME.cs_status import _cpu_test_name
+
+    assert _cpu_test_name(_GPU_NAME) == _CPU_NAME
+    assert _cpu_test_name(_CPU_NAME) is None
+    two_mods = "SMS.g.C.m_nvhpc.cam-a_gpu--cam-b"
+    assert _cpu_test_name(two_mods) == "SMS.g.C.m_nvhpc.cam-a--cam-b"
+    assert _cpu_test_name("SMS.g.C.m_nvhpc.cam-a_gpux") is None
+
 if __name__ == "__main__":
     unittest.main()

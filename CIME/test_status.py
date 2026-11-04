@@ -285,6 +285,26 @@ class TestStatus(object):
         self._phase_statuses[phase] = (status, comments)
         self._no_io = True
 
+    def report_status(self, phase, status, comments=""):
+        """Add or change a phase's status in memory only.
+
+        Like override_status, but the phase need not be recorded yet: for a
+        check a tool makes itself (cs.status' CPU/GPU comparison). Nothing is
+        written back to the TestStatus file.
+
+        Args:
+            phase (str): A phase from ALL_PHASES or a COMPARE_* phase.
+            status (str): The status to report.
+            comments (str): Details of the result.
+        """
+        expect(
+            phase in ALL_PHASES or phase.startswith(COMPARE_PHASE),
+            "Invalid phase '{}'".format(phase),
+        )
+        expect(status in ALL_PHASE_STATUSES, "Invalid status '{}'".format(status))
+        self._phase_statuses[phase] = (status, comments)
+        self._no_io = True
+
     def get_status(self, phase):
         return self._phase_statuses[phase][0] if phase in self._phase_statuses else None
 
