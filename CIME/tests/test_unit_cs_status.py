@@ -556,11 +556,127 @@ def test_cpu_gpu_only_for_gpu_tests_and_can_be_turned_off(tmp_path):
     assert _compare_line(_compare_status([gpu], compare_cpu_gpu=False)) is None
 
 
-def test_cpu_gpu_compare_never_writes_test_status(tmp_path):
+def _recorded_compare(test_dir):
+    """The COMPARE_cpu_gpu (status, comment) in test_dir's TestStatus file."""
+    ts = test_status.TestStatus(test_dir=str(test_dir))
+    phase = "COMPARE_cpu_gpu"
+    return ts.get_status(phase), ts.get_comment(phase)
+
+
+def test_cpu_gpu_result_is_recorded_in_test_status(tmp_path):
     gpu = _make_case(tmp_path, _GPU_NAME, "x1", _HIST)
-    _make_case(tmp_path, _CPU_NAME, "x1", _HIST)
+    cpu = _make_case(tmp_path, _CPU_NAME, "x1", _HIST)
+    cpu_before = (cpu / "TestStatus").read_text()
+    _compare_status([gpu])
+    status, comment = _recorded_compare(gpu)
+    assert status == "PASS"
+    assert comment.startswith("vs {}.x1: 2 history files IDENTICAL".format(_CPU_NAME))
+    assert "[GPU run 1.a, CPU run 1.a]" in comment
+    assert (cpu / "TestStatus").read_text() == cpu_before
+    # the other phases are kept
+    assert test_status.TestStatus(test_dir=str(gpu)).get_status("RUN") == "PASS"
+
+
+def test_cpu_gpu_recorded_result_is_reused_without_cprnc(tmp_path):
+    gpu = _make_case(tmp_path, _GPU_NAME, "x1", _HIST)
+    changed = dict(_HIST)
+    changed["cam.h1i.0001-01-01-01800.nc"] = "c"
+    _make_case(tmp_path, _CPU_NAME, "x1", changed)
+    first = _compare_line(_compare_status([gpu]))
+    calls = []
+    second = _compare_line(_compare_status([gpu], calls))
+    assert calls == []
+    assert second == first
+    assert second.split()[0] == "FAIL"
+
+
+def test_cpu_gpu_recompared_after_a_new_cpu_run(tmp_path):
+    gpu = _make_case(tmp_path, _GPU_NAME, "x1", _HIST)
+    cpu = _make_case(tmp_path, _CPU_NAME, "x1", _HIST)
+    _compare_status([gpu])
+    _write_log(cpu / "run", "atm.log.2.b", "END OF MODEL RUN\n", 200)
+    calls = []
+    line = _compare_line(_compare_status([gpu], calls))
+    assert len(calls) == 2
+    assert line.split()[0] == "PASS"
+    assert "[GPU run 1.a, CPU run 2.b]" in _recorded_compare(gpu)[1]
+
+
+def test_cpu_gpu_recompared_against_another_counterpart(tmp_path):
+    gpu = _make_case(tmp_path, _GPU_NAME, "s52a", _HIST)
+    cpu1 = _make_case(tmp_path, _CPU_NAME, "s51e", _HIST)
+    cpu2 = _make_case(tmp_path, _CPU_NAME, "s52e", _HIST)
+    _compare_status([gpu, cpu1])
+    calls = []
+    line = _compare_line(_compare_status([gpu, cpu2], calls))
+    assert len(calls) == 2
+    assert "vs {}.s52e".format(_CPU_NAME) in line
+
+
+def test_cpu_gpu_recorded_result_used_without_the_cpu_tests(tmp_path):
+    # cs.status.<gpu id> alone: the CPU tests (another test id) are not
+    # reported, so the counterpart comes from the recorded comparison.
+    gpu = _make_case(tmp_path, _GPU_NAME, "x1gpu", _HIST)
+    cpu = _make_case(tmp_path, _CPU_NAME, "x1", _HIST)
+    _compare_status([gpu, cpu])
+    calls = []
+    output = _compare_status([gpu], calls)
+    line = _compare_line(output)
+    assert calls == []
+    assert line.split()[0] == "PASS"
+    assert "vs {}.x1".format(_CPU_NAME) in line
+    assert "{} (Overall: PASS)".format(_GPU_NAME) in output
+
+
+def test_cpu_gpu_recorded_counterpart_recompared_after_a_new_cpu_run(tmp_path):
+    gpu = _make_case(tmp_path, _GPU_NAME, "x1gpu", _HIST)
+    cpu = _make_case(tmp_path, _CPU_NAME, "x1", _HIST)
+    _compare_status([gpu, cpu])
+    _write_log(cpu / "run", "atm.log.2.b", "END OF MODEL RUN\n", 200)
+    calls = []
+    line = _compare_line(_compare_status([gpu], calls))
+    assert len(calls) == 2
+    assert line.split()[0] == "PASS"
+    assert "[GPU run 1.a, CPU run 2.b]" in _recorded_compare(gpu)[1]
+
+
+def test_cpu_gpu_recorded_counterpart_gone_is_pending(tmp_path):
+    gpu = _make_case(tmp_path, _GPU_NAME, "x1gpu", _HIST)
+    cpu = _make_case(tmp_path, _CPU_NAME, "x1", _HIST)
+    _compare_status([gpu, cpu])
+    shutil.rmtree(str(cpu))
+    line = _compare_line(_compare_status([gpu]))
+    assert line.split()[0] == "PEND"
+    assert "no CPU counterpart" in line
+
+
+def test_cpu_gpu_pending_is_not_recorded(tmp_path):
+    gpu = _make_case(tmp_path, _GPU_NAME, "x1", _HIST)
+    _make_case(tmp_path, _CPU_NAME, "x1", _HIST, run_status="PEND")
     before = (gpu / "TestStatus").read_text()
     _compare_status([gpu])
+    _compare_status([gpu], compare_cpu_gpu=True)
+    assert (gpu / "TestStatus").read_text() == before
+
+
+def test_cpu_gpu_not_recorded_after_a_false_run_pass(tmp_path):
+    gpu = _make_case(tmp_path, _GPU_NAME, "x1", _HIST)
+    _make_case(tmp_path, _CPU_NAME, "x1", _HIST)
+    _write_log(gpu / "run", "atm.log.2.b", "aborted\n", 200)
+    before = (gpu / "TestStatus").read_text()
+    line = _compare_line(_compare_status([gpu]))
+    assert line.split()[0] == "PEND"
+    assert (gpu / "TestStatus").read_text() == before
+
+
+def test_cpu_gpu_not_recorded_while_gpu_test_has_pending_phases(tmp_path):
+    gpu = _make_case(tmp_path, _GPU_NAME, "x1", _HIST)
+    _make_case(tmp_path, _CPU_NAME, "x1", _HIST)
+    with test_status.TestStatus(test_dir=str(gpu)) as ts:
+        ts.set_status(test_status.BASELINE_PHASE, test_status.TEST_PEND_STATUS)
+    before = (gpu / "TestStatus").read_text()
+    line = _compare_line(_compare_status([gpu]))
+    assert line.split()[0] == "PASS"
     assert (gpu / "TestStatus").read_text() == before
 
 

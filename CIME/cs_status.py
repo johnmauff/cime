@@ -27,8 +27,8 @@ from collections import defaultdict
 # A run log: <component>.log.<lid>, possibly gzipped.
 _RUN_LOG_RE = re.compile(r"^\w+\.log\.(?P<lid>.+?)(\.gz)?$")
 
-# Reported (never written) for a GPU test: its history files compared with
-# those of its CPU counterpart, bit for bit.
+# A GPU test's history files compared with those of its CPU counterpart, bit
+# for bit. A final result is recorded in the GPU test's TestStatus file.
 CPU_GPU_COMPARE_PHASE = "{}_cpu_gpu".format(COMPARE_PHASE)
 
 # A GPU test's testmod ends in "_gpu"; its CPU counterpart's testmod is the
@@ -38,8 +38,13 @@ _GPU_TESTMOD_RE = re.compile(r"_gpu(?=--|$)")
 # A history file in a run directory: <case>.<component>.h<tape>....nc
 _HIST_FILE_RE = re.compile(r"^\w+\.h\w*\..*\.nc$")
 
+# The recorded comparison's counterpart: "vs <CPU test directory name>: ...".
+_RECORDED_AGAINST_RE = re.compile(r"^vs ([^/\s]+): ")
+
 _CPRNC_IDENTICAL = "the two files seem to be IDENTICAL"
 _CPRNC_FIELD_RE = re.compile(r"^\s*RMS\s+(\S+)")
+
+logger = logging.getLogger(__name__)
 
 
 def cs_status(
@@ -94,6 +99,14 @@ def cs_status(
     and FAIL on any difference or missing file. cprnc(test_dir, file1,
     file2) returns cprnc's output for the GPU test in test_dir (default:
     run the case's CCSM_CPRNC).
+
+    A PASS or FAIL is written to the GPU test's TestStatus file (once the
+    test has no pending phase), with the two runs it compared, and reused
+    by later calls without running cprnc again; it is redone when either
+    test has run again or the counterpart is a different test. When no
+    counterpart is found (cs.status.<gpu id> without -t), the CPU test named
+    in the recorded result is used, if its directory is still next to the
+    GPU test.
     """
     expect(not (summary and fails_only), "Cannot have both summary and fails_only")
     expect(
@@ -238,8 +251,11 @@ def _report_cpu_gpu_compare(test_dir, ts, loaded, run_dir_lookup, cprnc):
         return
     cpu_dir, cpu_ts = _find_cpu_counterpart(test_dir, cpu_name, loaded, run_dir_lookup)
     if cpu_dir is None:
-        ts.report_status(CPU_GPU_COMPARE_PHASE, TEST_PEND_STATUS, cpu_ts)
-        return
+        recorded = _recorded_counterpart(test_dir, ts, cpu_name, run_dir_lookup)
+        if recorded is None:
+            ts.report_status(CPU_GPU_COMPARE_PHASE, TEST_PEND_STATUS, cpu_ts)
+            return
+        cpu_dir, cpu_ts = recorded
     against = "vs {}".format(os.path.basename(cpu_dir))
     if (
         ts.get_status(RUN_PHASE) != TEST_PASS_STATUS
@@ -251,14 +267,73 @@ def _report_cpu_gpu_compare(test_dir, ts, loaded, run_dir_lookup, cprnc):
             "{}: waiting for both runs to PASS".format(against),
         )
         return
+    gpu_run_dir = run_dir_lookup(test_dir)
+    cpu_run_dir = run_dir_lookup(cpu_dir)
+    gpu_lid = _newest_run_lid(gpu_run_dir)
+    cpu_lid = _newest_run_lid(cpu_run_dir)
+    runs = " [GPU run {}, CPU run {}]".format(gpu_lid, cpu_lid)
+    comment = ts.get_comment(CPU_GPU_COMPARE_PHASE)
+    if (
+        ts.get_status(CPU_GPU_COMPARE_PHASE) in (TEST_PASS_STATUS, TEST_FAIL_STATUS)
+        and comment.startswith(against + ":")
+        and comment.endswith(runs)
+    ):
+        return  # recorded for these two runs
     status, detail = _compare_history(
-        run_dir_lookup(test_dir),
+        gpu_run_dir,
         os.path.basename(test_dir),
-        run_dir_lookup(cpu_dir),
+        cpu_run_dir,
         os.path.basename(cpu_dir),
         lambda gpu_file, cpu_file: cprnc(test_dir, cpu_file, gpu_file),
     )
-    ts.report_status(CPU_GPU_COMPARE_PHASE, status, "{}: {}".format(against, detail))
+    comment = "{}: {}{}".format(against, detail, runs)
+    ts.report_status(CPU_GPU_COMPARE_PHASE, status, comment)
+    pending = any(
+        phase_status == TEST_PEND_STATUS
+        for phase, phase_status in ts
+        if phase != CPU_GPU_COMPARE_PHASE
+    )
+    if gpu_lid is not None and cpu_lid is not None and not pending:
+        _record_status(test_dir, CPU_GPU_COMPARE_PHASE, status, comment)
+
+
+def _recorded_counterpart(test_dir, ts, cpu_name, run_dir_lookup):
+    """The CPU counterpart named by the GPU test's recorded comparison.
+
+    Used when the counterpart is not among the reported tests and has
+    another test id (cs.status.<gpu id> without -t): the recorded
+    COMPARE_cpu_gpu comment starts with "vs <CPU test directory name>:",
+    a directory next to the GPU test.
+
+    Returns:
+        tuple or None: (test_dir, TestStatus) of that counterpart, or None
+        if nothing is recorded or the directory is not that test's.
+    """
+    match = _RECORDED_AGAINST_RE.match(ts.get_comment(CPU_GPU_COMPARE_PHASE))
+    if match is None:
+        return None
+    cpu_dir = os.path.join(os.path.dirname(test_dir), match.group(1))
+    if not os.path.isfile(os.path.join(cpu_dir, "TestStatus")):
+        return None
+    cpu_ts = TestStatus(test_dir=cpu_dir)
+    if cpu_ts.get_name() != cpu_name:
+        return None
+    _recheck_run(cpu_ts, cpu_dir, run_dir_lookup)
+    return cpu_dir, cpu_ts
+
+
+def _record_status(test_dir, phase, status, comment):
+    """Writes one phase's status to the TestStatus file in test_dir.
+
+    The file is re-read first, so phases reported only in memory (such as a
+    re-checked RUN) are not written. A file that can't be written is left
+    as it is.
+    """
+    try:
+        with TestStatus(test_dir=test_dir) as ts:
+            ts.set_status(phase, status, comments=comment)
+    except OSError as err:
+        logger.warning("Could not record {} in {}: {}".format(phase, test_dir, err))
 
 
 def _history_files(run_dir, case):
@@ -357,6 +432,24 @@ def _case_run_dir(test_dir):
         return None
 
 
+def _run_logs(run_dir):
+    """Maps each run log in run_dir to its run id (lid); {} if none."""
+    if run_dir is None or not os.path.isdir(run_dir):
+        return {}
+    logs = {}
+    for name in os.listdir(run_dir):
+        match = _RUN_LOG_RE.match(name)
+        if match:
+            logs[os.path.join(run_dir, name)] = match.group("lid")
+    return logs
+
+
+def _newest_run_lid(run_dir):
+    """The run id (lid) of the newest run log in run_dir, or None."""
+    logs = _run_logs(run_dir)
+    return logs[max(logs, key=os.path.getmtime)] if logs else None
+
+
 def _unterminated_run(run_dir):
     """Checks that the newest run in run_dir terminated.
 
@@ -368,13 +461,7 @@ def _unterminated_run(run_dir):
         a log of the newest run contains a termination message, or if there
         is nothing to check (no run directory or no run logs).
     """
-    if run_dir is None or not os.path.isdir(run_dir):
-        return None
-    logs = {}
-    for name in os.listdir(run_dir):
-        match = _RUN_LOG_RE.match(name)
-        if match:
-            logs[os.path.join(run_dir, name)] = match.group("lid")
+    logs = _run_logs(run_dir)
     if not logs:
         return None
     lid = logs[max(logs, key=os.path.getmtime)]
